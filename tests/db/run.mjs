@@ -240,5 +240,12 @@ check('non-admin cannot change platform fee', (await as(U.alpha, `update platfor
 await as(BOSS, `update platform_settings set platform_fee_bps = 100`);
 check('super admin sets platform fee', (await db.query(`select platform_fee_bps from platform_settings`)).rows[0].platform_fee_bps === 100);
 
+console.log('Tax precision');
+check('Quebec preset keeps 14.975%', (await db.query(`select rate::text r from tax_presets where code = 'CA-QC-GSTQST'`)).rows[0].r === '0.149750');
+const qc = (await as(BOSS, `select create_operator('QC Limo','qc-limo','CA','CAD','fr','America/Montreal','metric',true,'CA-QC-GSTQST') id`)).rows[0].id;
+const qcSedan = (await as(BOSS, `select id from vehicle_classes where org_id = $1 and name = 'Sedan'`, [qc])).rows[0].id;
+const qq = (await as(BOSS, `select quote_price($1,$2,'one_way',30,0) q`, [qc, qcSedan])).rows[0].q;
+check('Quebec quote: 120.00 + 17.97 = 137.97', qq.tax_total === 17.97 && qq.total === 137.97, JSON.stringify(qq));
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
