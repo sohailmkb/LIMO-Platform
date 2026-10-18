@@ -271,6 +271,13 @@ check('cannot reprice a cancelled booking', await fails(U.alpha, `select reprice
 await as(U.alpha, `update orgs set billing_address = '1 King St W, Toronto', tax_number = '123456789 RT0001' where id = $1`, [a]);
 check('owner saves invoice details', (await as(U.alpha, `select tax_number from orgs where id = $1`, [a])).rows[0].tax_number === '123456789 RT0001');
 check('customer reads tax label for receipt', (await as(CUST2, `select count(*)::int n from tax_rates`)).rows[0].n >= 1);
+check('customer reads own trips, lines and company for My trips',
+  (await as(CUST2, `select count(*)::int n from trips`)).rows[0].n === 2 &&
+  (await as(CUST2, `select count(*)::int n from booking_lines`)).rows[0].n >= 2 &&
+  (await as(CUST2, `select count(*)::int n from orgs`)).rows[0].n >= 1);
+check('customer cannot read other customers contacts or payments',
+  (await as(CUST2, `select count(*)::int n from contacts`)).rows[0].n === 0 &&
+  (await as(CUST2, `select count(*)::int n from payments`)).rows[0].n === 0);
 check('bravo cannot cancel alpha', await fails(U.bravo, `select cancel_booking($1)`, [bk]));
 
 console.log(`\n${passed} passed, ${failed} failed`);
