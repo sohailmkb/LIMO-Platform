@@ -41,7 +41,7 @@ async function fails(user, sql, params = []) {
 // --- Supabase shim -------------------------------------------------
 await db.exec(`
   create schema auth;
-  create table auth.users (id uuid primary key, email text);
+  create table auth.users (id uuid primary key, email text, created_at timestamptz default now(), last_sign_in_at timestamptz);
   create function auth.uid() returns uuid language sql stable as $$
     select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
   create role anon nologin;
@@ -167,6 +167,54 @@ const d2 = (await as(U.alpha, `insert into drivers (org_id, full_name) values ($
 check('account already used by another driver', (await as(U.alpha, `select grant_driver_app_access($1,'later@test.com') r`, [d2])).rows[0].r === 'account_used_by_other_driver');
 check('driver cannot grant access', await fails(U.driver, `select grant_driver_app_access($1,'x@test.com')`, [d2]));
 check('bravo cannot grant on alpha driver', await fails(U.bravo, `select grant_driver_app_access($1,'later@test.com')`, [d2]));
+
+console.log('Super admin');
+const BOSS = '00000000-0000-0000-0000-0000000000ff';
+await db.query(`insert into auth.users (id, email) values ($1, 'boss@test.com')`, [BOSS]);
+check('non-admin cannot open overview', await fails(U.alpha, `select platform_overview()`));
+check('non-admin is not admin', (await as(U.alpha, `select am_platform_admin() a`)).rows[0].a === false);
+await db.query(`insert into platform_admins (user_id) values ($1)`, [BOSS]);
+check('admin is admin', (await as(BOSS, `select am_platform_admin() a`)).rows[0].a === true);
+check('admin sees every company', (await as(BOSS, `select count(*)::int n from orgs`)).rows[0].n === 2);
+check('admin reads all bookings', (await as(BOSS, `select count(*)::int n from bookings`)).rows[0].n >= 3);
+check('admin reads driver pay', (await as(BOSS, `select count(*)::int n from trip_costs`)).rows[0].n === 1);
+await as(BOSS, `update vehicle_classes set name = 'Executive Sedan' where org_id = $1 and name = 'Sedan'`, [b]);
+check('admin edits another company data', (await as(U.bravo, `select count(*)::int n from vehicle_classes where name = 'Executive Sedan'`)).rows[0].n === 1);
+check('admin books for a company', !!(await as(BOSS, `select create_booking($1,null,'Admin Test',null,'one_way',$2, now() + interval '3 days','A','B',10,0) id`, [a, sedanA])).rows[0].id);
+check('owner cannot change own plan', await fails(U.alpha, `update orgs set plan_id = 'scale' where id = $1`, [a]));
+check('owner cannot extend own trial', await fails(U.alpha, `update orgs set trial_ends_at = now() + interval '1 year' where id = $1`, [a]));
+await as(U.alpha, `update orgs set name = 'Alpha Limo Inc' where id = $1`, [a]);
+check('owner can still rename company', (await as(U.alpha, `select name from orgs where id = $1`, [a])).rows[0].name === 'Alpha Limo Inc');
+await as(BOSS, `select platform_set_company_plan($1, 'growth', now() + interval '30 days')`, [a]);
+check('admin changes plan', (await as(U.alpha, `select plan_id from orgs`)).rows[0].plan_id === 'growth');
+const ov = (await as(BOSS, `select platform_overview() o`)).rows[0].o;
+check('overview counts', ov.companies === 2 && ov.operators === 2 && ov.users >= 6 && ov.booking_value_30d.CAD > 0, JSON.stringify(ov));
+const comps = (await as(BOSS, `select * from platform_companies()`)).rows;
+check('company list with owner emails', comps.length === 2 && comps.some(c => c.owner_email === 'alpha@test.com' && Number(c.driver_count) >= 2));
+const us = (await as(BOSS, `select * from platform_users('newdriver')`)).rows;
+check('user search with memberships', us.length === 1 && us[0].memberships.length === 1 && us[0].memberships[0].role === 'driver');
+const cc = (await as(BOSS, `select platform_create_company('newdriver@test.com','Globe Travel','globe-travel','GB','GBP','en','Europe/London','imperial',true,'GB-VAT-20','travel_agency') r`)).rows[0].r;
+check('admin creates travel agency for a user', cc.result === 'created');
+check('travel agency gets no fleet', (await as(BOSS, `select count(*)::int n from vehicle_classes where org_id = $1`, [cc.org_id])).rows[0].n === 0);
+check('travel agency not in operator directory', (await as(BOSS, `select count(*)::int n from network_directory() where slug = 'globe-travel'`)).rows[0].n === 0);
+check('create for unknown email returns no_account', (await as(BOSS, `select platform_create_company('ghost@test.com','X','x-co','CA','CAD','en') r`)).rows[0].r.result === 'no_account');
+check('non-admin cannot create company for others', await fails(U.alpha, `select platform_create_company('alpha@test.com','X','x2','CA','CAD','en')`));
+await as(BOSS, `select platform_set_company_status($1, 'suspended', 'Unpaid invoice')`, [b]);
+check('suspended staff lose access', (await as(U.bravo, `select count(*)::int n from orgs`)).rows[0].n === 0);
+check('suspended company hidden from portal', (await asAnon(`select public_operator('bravo') p`)).rows[0].p === null);
+check('suspended company cannot take bookings', await (async () => { try { await asAnon(`select public_create_booking('bravo',$1,'one_way', now() + interval '2 days','A','B',5,0,'X','x@y.z',null)`, [sedanB]); return false; } catch { return true; } })());
+check('suspended company hidden from network', (await as(U.alpha, `select count(*)::int n from network_directory() where slug = 'bravo'`)).rows[0].n === 0);
+check('admin still sees suspended company', (await as(BOSS, `select status from orgs where id = $1`, [b])).rows[0].status === 'suspended');
+await as(BOSS, `select platform_set_company_status($1, 'active')`, [b]);
+check('reactivated staff regain access', (await as(U.bravo, `select count(*)::int n from orgs`)).rows[0].n === 1);
+const au = (await as(BOSS, `select * from platform_audit(50)`)).rows;
+check('audit feed shows admin actions', au.some(r => r.action === 'platform_set_status' && r.actor_email === 'boss@test.com'));
+check('non-admin cannot read audit feed', await fails(U.alpha, `select * from platform_audit(10)`));
+await db.query(`insert into auth.users (id, email) values ('00000000-0000-0000-0000-0000000000a7', 'ota@test.com')`);
+const ota = (await as('00000000-0000-0000-0000-0000000000a7', `select create_operator('Trip Agency','trip-agency','FR','EUR','fr','Europe/Paris','metric',true,'FR-VAT-20','travel_agency') id`)).rows[0].id;
+check('travel agency can self sign-up', (await as('00000000-0000-0000-0000-0000000000a7', `select kind from orgs where id = $1`, [ota])).rows[0].kind === 'travel_agency');
+check('self sign-up still defaults to operator', (await as(BOSS, `select kind from orgs where id = $1`, [a])).rows[0].kind === 'operator');
+check('admin cannot be added by app users', await fails(U.alpha, `insert into platform_admins (user_id) values ($1)`, [U.alpha]));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
