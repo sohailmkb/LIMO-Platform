@@ -280,5 +280,107 @@ check('customer cannot read other customers contacts or payments',
   (await as(CUST2, `select count(*)::int n from payments`)).rows[0].n === 0);
 check('bravo cannot cancel alpha', await fails(U.bravo, `select cancel_booking($1)`, [bk]));
 
+console.log('Booking depth (0010)');
+{
+  const near = (x, y) => Math.abs(Number(x) - Number(y)) < 0.001;
+  const sumOk = (q) => near(q.total, q.lines.reduce((s, l) => s + Number(l.amount) + Number(l.tax_amount), 0));
+  const P = (o) => JSON.stringify({ class_id: sedanA, service: 'one_way', distance: 30, ...o });
+  const pr = async (o) => (await as(U.alpha, `select price_trip($1,$2::jsonb) q`, [a, P(o)])).rows[0].q;
+
+  let q = await pr({});
+  check('price_trip one way 30 km: 120 + 15.60 HST', near(q.subtotal, 120) && near(q.tax_total, 15.6) && sumOk(q), JSON.stringify(q));
+  q = await pr({ round_trip: true });
+  check('round trip doubles the fare', near(q.subtotal, 240) && q.lines.filter(l => l.kind === 'fare').length === 2);
+  await as(U.alpha, `update rate_cards set per_stop = 15 where class_id = $1 and service_type = 'one_way'`, [sedanA]);
+  await as(U.alpha, `update rate_cards set min_hours = 3 where class_id = $1 and service_type = 'hourly'`, [sedanA]);
+  q = await pr({ stops: 2 });
+  check('two extra stops add 30', near(q.subtotal, 150) && q.lines.some(l => l.code === 'stops' && near(l.amount, 30)));
+  q = await pr({ service: 'hourly', hours: 2, distance: 0 });
+  check('hourly bills the 3 hour minimum (225)', near(q.subtotal, 225), JSON.stringify(q.lines));
+
+  const seat = (await as(U.alpha, `insert into extras (org_id, name, price, max_qty) values ($1,'Child seat',20,3) returning id`, [a])).rows[0].id;
+  const greet = (await as(U.alpha, `insert into extras (org_id, name, price, taxable) values ($1,'Meet and greet',25,false) returning id`, [a])).rows[0].id;
+  q = await pr({ extras: [{ id: seat, qty: 2 }, { id: greet, qty: 5 }] });
+  check('extras: 2 seats taxed, meet and greet untaxed and capped at 1',
+    near(q.subtotal, 185) && near(q.tax_total, 15.6 + 5.2) && sumOk(q), JSON.stringify(q.lines));
+
+  await as(U.alpha, `insert into promo_codes (org_id, code, kind, value) values ($1,'Save10','percent',10), ($1,'OLD','fixed',5)`, [a]);
+  await as(U.alpha, `update promo_codes set ends_at = now() - interval '1 day' where code = 'OLD'`);
+  q = await pr({ stops: 1, promo_code: 'save10', extras: [{ id: seat, qty: 1 }] });
+  check('promo 10% on fare and stops only (13.50 off)', q.promo.applied && near(q.subtotal, 120 + 15 + 20 - 13.5) && sumOk(q), JSON.stringify(q));
+  q = await pr({ promo_code: 'OLD' });
+  check('expired promo is reported, not applied', q.promo.applied === false && q.promo.reason === 'expired' && near(q.subtotal, 120));
+  q = await pr({ promo_code: 'NOPE' });
+  check('unknown promo is reported as invalid', q.promo.reason === 'invalid');
+  q = await pr({ tip_percent: 15 });
+  check('15% gratuity on the fare, not taxed', near(q.subtotal, 138) && near(q.tax_total, 15.6));
+  const bravoSedan = (await as(U.bravo, `select id from vehicle_classes where name = 'Sedan' limit 1`)).rows[0]?.id;
+  check('extra from another company is rejected', await fails(U.alpha, `select price_trip($1,$2::jsonb)`,
+    [a, P({ extras: [{ id: (await db.query(`select gen_random_uuid() id`)).rows[0].id }] })]));
+  const pub = (await asAnon(`select public_price_trip('alpha', $1::jsonb) q`, [P({ round_trip: true })])).rows[0].q;
+  check('public price check works signed out', near(pub.subtotal, 240));
+
+  // Staff booking: round trip, 2 stops, flight, promo
+  const when = new Date(Date.now() + 3 * 864e5).toISOString();
+  const back = new Date(Date.now() + 4 * 864e5).toISOString();
+  const spec = P({ round_trip: true, promo_code: 'SAVE10', passenger_name: 'Robin Rider', passenger_phone: '+14165550111',
+    pickup_at: when, return_at: back, pickup_address: 'Pearson T1', dropoff_address: 'Fairmont Royal York',
+    stops_list: [{ address: 'CN Tower' }, { address: 'Union Station' }], flight_number: 'ac 101', meet_greet: true,
+    passenger_count: 3, luggage_count: 4, extras: [{ id: greet }] });
+  const expected = (await as(U.alpha, `select price_trip($1, ($2::jsonb) || '{"stops":2}') q`, [a, spec])).rows[0].q;
+  const used0 = (await db.query(`select used_count from promo_codes where code = 'Save10'`)).rows[0].used_count;
+  const nb = (await as(U.alpha, `select create_booking_v2($1,$2,$3::jsonb) id`, [a, contact, spec])).rows[0].id;
+  const nbRow = (await as(U.alpha, `select total, status, round_trip, promo_code, passenger_count from bookings where id = $1`, [nb])).rows[0];
+  check('create_booking_v2 total matches price_trip', near(nbRow.total, expected.total) && nbRow.status === 'confirmed' && nbRow.round_trip, JSON.stringify({ nbRow, t: expected.total }));
+  const legs = (await as(U.alpha, `select leg, pickup_address, dropoff_address, flight_number, meet_greet from trips where booking_id = $1 order by pickup_at`, [nb])).rows;
+  check('round trip makes an outbound and a reversed return leg',
+    legs.length === 2 && legs[1].leg === 'return' && legs[1].pickup_address === 'Fairmont Royal York' && legs[1].dropoff_address === 'Pearson T1');
+  check('flight number is stored upper case with meet and greet', legs[0].flight_number === 'AC 101' && legs[0].meet_greet === true);
+  check('stops saved in order', (await as(U.alpha, `select string_agg(address, '>' order by seq) s from trip_stops s join trips t on t.id = s.trip_id where t.booking_id = $1`, [nb])).rows[0].s === 'CN Tower>Union Station');
+  check('promo use is counted', (await db.query(`select used_count from promo_codes where code = 'Save10'`)).rows[0].used_count === used0 + 1);
+  check('return before pickup is rejected', await fails(U.alpha, `select create_booking_v2($1,$2,$3::jsonb)`, [a, contact, P({ round_trip: true, passenger_name: 'X', pickup_at: back, return_at: when, pickup_address: 'A' })]));
+  check('driver cannot use create_booking_v2', await fails(U.driver, `select create_booking_v2($1,$2,$3::jsonb)`, [a, contact, spec]));
+  check('bravo cannot book on alpha with v2', await fails(U.bravo, `select create_booking_v2($1,null,$2::jsonb)`, [a, spec]));
+  check('customer sees stops of own booking', (await as(U.customer, `select count(*)::int n from trip_stops`)).rows[0].n === 2);
+  check('bravo sees no alpha stops', (await as(U.bravo, `select count(*)::int n from trip_stops`)).rows[0].n === 0);
+
+  // Customer request and online quote acceptance
+  const req = (await asAnon(`select public_create_booking_v2('alpha', $1::jsonb) r`, [P({
+    booker_name: 'Quinn Quote', booker_email: 'Quinn@Example.com', pickup_at: when, pickup_address: 'Union Station',
+    dropoff_address: 'Pearson T3', extras: [{ id: seat }], passenger_count: 2 })])).rows[0].r;
+  check('portal request lands as a quote', !!req.public_code && near(req.total, 158.2), JSON.stringify(req));
+  check('portal request with a bad email is rejected', await (async () => { try { await asAnon(`select public_create_booking_v2('alpha', $1::jsonb)`, [P({ booker_name: 'Q', booker_email: 'nope', pickup_at: when, pickup_address: 'A' })]); return false; } catch { return true; } })());
+  let st = (await asAnon(`select public_booking_status('alpha', $1) s`, [req.public_code])).rows[0].s;
+  check('status shows price lines and cannot accept yet', st.lines.length === 2 && st.can_accept === false && st.status === 'quoted');
+  check('accepting before it is sent fails', await (async () => { try { await asAnon(`select public_accept_quote('alpha', $1)`, [req.public_code]); return false; } catch { return true; } })());
+  const reqId = (await db.query(`select id from bookings where public_code = $1`, [req.public_code])).rows[0].id;
+  check('driver cannot send a quote', await fails(U.driver, `select send_quote($1)`, [reqId]));
+  await as(U.alpha, `select send_quote($1)`, [reqId]);
+  st = (await asAnon(`select public_booking_status('alpha', $1) s`, [req.public_code])).rows[0].s;
+  check('sent quote can be accepted', st.can_accept === true && !!st.quote_expires_at);
+  check('customer accepts the quote', (await asAnon(`select public_accept_quote('alpha', $1) r`, [req.public_code])).rows[0].r === 'confirmed');
+  check('accepting twice is harmless', (await asAnon(`select public_accept_quote('alpha', $1) r`, [req.public_code])).rows[0].r === 'confirmed');
+  const req2 = (await asAnon(`select public_create_booking_v2('alpha', $1::jsonb) r`, [P({ booker_name: 'Quinn Quote', booker_email: 'quinn@example.com', pickup_at: when, pickup_address: 'A' })])).rows[0].r;
+  check('same email reuses the customer', (await db.query(`select count(*)::int n from contacts where lower(email) = 'quinn@example.com'`)).rows[0].n === 1);
+  const req2Id = (await db.query(`select id from bookings where public_code = $1`, [req2.public_code])).rows[0].id;
+  await as(U.alpha, `select send_quote($1)`, [req2Id]);
+  await db.query(`update bookings set quote_expires_at = now() - interval '1 hour' where id = $1`, [req2Id]);
+  check('expired quote cannot be accepted', await (async () => { try { await asAnon(`select public_accept_quote('alpha', $1)`, [req2.public_code]); return false; } catch { return true; } })());
+  await as(U.alpha, `select confirm_booking($1)`, [req2Id]);
+  check('staff can confirm a quote directly', (await db.query(`select status from bookings where id = $1`, [req2Id])).rows[0].status === 'confirmed');
+
+  // Driver pay
+  await as(U.alpha, `update drivers set pay_percent = 40 where id = $1`, [driverId]);
+  const out = (await as(U.alpha, `select id from trips where booking_id = $1 and leg = 'outbound'`, [nb])).rows[0].id;
+  await as(U.alpha, `update trips set driver_id = $2, status = 'assigned' where id = $1`, [out, driverId]);
+  await as(U.alpha, `update trips set status = 'completed' where id = $1`, [out]);
+  const fares = (await as(U.alpha, `select sum(amount) s from booking_lines where booking_id = $1 and kind in ('fare','surcharge','discount')`, [nb])).rows[0].s;
+  const pay = (await as(U.alpha, `select driver_pay from trip_costs where trip_id = $1`, [out])).rows[0]?.driver_pay;
+  check('completed trip gets 40% of its fare share as driver pay', near(pay, Math.round(Number(fares) / 2 * 0.4 * 100) / 100), `${pay} vs ${fares}`);
+  const op = (await asAnon(`select public_operator('alpha') o`)).rows[0].o;
+  check('public operator lists extras and promo flag', op.extras.length === 2 && op.has_promos === true && op.classes[0].services.length === 2);
+  check('promo codes are staff only', (await as(U.customer, `select count(*)::int n from promo_codes`)).rows[0].n === 0);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

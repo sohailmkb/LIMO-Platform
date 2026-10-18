@@ -15,7 +15,8 @@ Do this in the Supabase dashboard for your project. Keep the service role key ou
 9. Paste `0007_stripe.sql` and run it (card payments). Then follow `docs/STRIPE_SETUP.md`.
 10. Paste `0008_tax_precision.sql` and run it (exact Quebec tax rate).
 11. Paste `0009_ops_depth.sql` and run it (customer web sign-in, re-price, cancel with reason).
-12. Make yourself super admin: `insert into platform_admins (user_id) select id from auth.users where email = 'YOUR_EMAIL';`
+12. Paste `0010_booking_depth.sql` and run it (round trips, stops, extras, promo codes, quotes, branding). For address search see `docs/MAPS_SETUP.md`.
+13. Make yourself super admin: `insert into platform_admins (user_id) select id from auth.users where email = 'YOUR_EMAIL';`
 
 If any step errors, copy the full error text back to Claude. Do not edit the SQL yourself.
 
