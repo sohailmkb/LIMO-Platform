@@ -28,6 +28,12 @@ async function as(user, sql, params = []) {
   try { return await db.query(sql, params); }
   finally { await db.exec('reset role'); }
 }
+async function asAnon(sql, params = []) {
+  await db.query(`select set_config('request.jwt.claim.sub', '', false)`);
+  await db.exec('set role anon');
+  try { return await db.query(sql, params); }
+  finally { await db.exec('reset role'); }
+}
 async function fails(user, sql, params = []) {
   try { await as(user, sql, params); return false; } catch { return true; }
 }
@@ -35,7 +41,7 @@ async function fails(user, sql, params = []) {
 // --- Supabase shim -------------------------------------------------
 await db.exec(`
   create schema auth;
-  create table auth.users (id uuid primary key);
+  create table auth.users (id uuid primary key, email text);
   create function auth.uid() returns uuid language sql stable as $$
     select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
   create role anon nologin;
@@ -52,7 +58,8 @@ for (const f of readdirSync(join(root, 'migrations')).filter(f => f.endsWith('.s
 await db.exec(readFileSync(join(root, 'seed.sql'), 'utf8'));
 console.log('  applied seed.sql');
 
-for (const id of Object.values(U)) await db.query('insert into auth.users (id) values ($1)', [id]);
+for (const [k, id] of Object.entries(U)) await db.query('insert into auth.users (id, email) values ($1, $2)', [id, `${k}@test.com`]);
+await db.query(`insert into auth.users (id, email) values ('00000000-0000-0000-0000-0000000000d2', 'newdriver@test.com')`);
 
 console.log('Sign-up');
 const a = (await as(U.alpha, `select create_operator('Alpha Limo','alpha','CA','CAD','en','America/Toronto','metric',false,'CA-ON-HST') id`)).rows[0].id;
@@ -118,6 +125,35 @@ check('bravo still cannot see alpha bookings', (await as(U.bravo, `select count(
 
 console.log('Public');
 check('directory lists both operators', (await db.query(`select count(*)::int n from network_directory()`)).rows[0].n === 2);
+
+console.log('Public portal (signed out)');
+const op = (await asAnon(`select public_operator('alpha') p`)).rows[0].p;
+check('portal reads operator and 3 classes', op.name === 'Alpha Limo' && op.classes.length === 3 && op.currency === 'CAD');
+check('portal reads no private columns', op.stripe_account_id === undefined && op.id === undefined);
+const pq = (await asAnon(`select public_quote('alpha',$1,'one_way',30,0) q`, [sedanA])).rows[0].q;
+check('portal quote is 135.60', pq.total === 135.6);
+const pb = (await asAnon(`select public_create_booking('alpha',$1,'one_way', now() + interval '2 days','Pearson T3','Yorkville',30,0,'Robin Rider','Robin@Example.com','+14165550123') r`, [sedanA])).rows[0].r;
+check('portal booking created as quoted for 135.60', pb.status === 'quoted' && pb.total === 135.6 && pb.public_code?.length === 8, JSON.stringify(pb));
+const st = (await asAnon(`select public_booking_status('alpha',$1) s`, [pb.public_code])).rows[0].s;
+check('portal status page works', st && st.status === 'quoted' && st.pickup_address === 'Pearson T3');
+check('status needs the right operator', (await asAnon(`select public_booking_status('bravo',$1) s`, [pb.public_code])).rows[0].s === null);
+check('portal rejects past pickup', await (async () => { try { await asAnon(`select public_create_booking('alpha',$1,'one_way', now(),'A','B',5,0,'X','x@y.z',null)`, [sedanA]); return false; } catch { return true; } })());
+check('portal rejects another operator class', await (async () => { try { await asAnon(`select public_create_booking('bravo',$1,'one_way', now() + interval '2 days','A','B',5,0,'X','x@y.z',null)`, [sedanA]); return false; } catch { return true; } })());
+check('anon cannot read bookings table', await (async () => { try { await asAnon(`select count(*) from bookings`); return false; } catch { return true; } })());
+check('alpha staff sees the portal booking', (await as(U.alpha, `select count(*)::int n from bookings where status='quoted'`)).rows[0].n === 1);
+const pb2 = (await asAnon(`select public_create_booking('alpha',$1,'hourly', now() + interval '3 days','Hotel X',null,0,3,'Robin Rider','robin@example.com',null) r`, [sedanA])).rows[0].r;
+check('repeat customer reuses one contact', (await as(U.alpha, `select count(*)::int n from contacts where email='robin@example.com'`)).rows[0].n === 1 && !!pb2.public_code);
+
+console.log('Team');
+check('owner adds driver by email', (await as(U.alpha, `select add_member_by_email($1,'NewDriver@test.com','driver','Nia Driver') r`, [a])).rows[0].r === 'added');
+check('driver row created and linked', (await as(U.alpha, `select count(*)::int n from drivers where full_name='Nia Driver' and user_id is not null`)).rows[0].n === 1);
+check('unknown email returns no_account', (await as(U.alpha, `select add_member_by_email($1,'nobody@test.com','driver') r`, [a])).rows[0].r === 'no_account');
+check('repeat add returns already_member', (await as(U.alpha, `select add_member_by_email($1,'newdriver@test.com','driver') r`, [a])).rows[0].r === 'already_member');
+check('driver cannot add members', await fails(U.driver, `select add_member_by_email($1,'x@test.com','admin')`, [a]));
+check('bravo cannot add to alpha', await fails(U.bravo, `select add_member_by_email($1,'x@test.com','admin')`, [a]));
+const tm = (await as(U.alpha, `select email, role from team_members($1)`, [a])).rows;
+check('team list shows emails', tm.some(r => r.email === 'newdriver@test.com' && r.role === 'driver'));
+check('bravo cannot list alpha team', (await as(U.bravo, `select count(*)::int n from team_members($1)`, [a])).rows[0].n === 0);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

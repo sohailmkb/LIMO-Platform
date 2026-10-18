@@ -9,6 +9,7 @@ Do this in the Supabase dashboard for your project. Keep the service role key ou
 3. Paste `0002_operations.sql` and run it.
 4. Paste `0003_security_and_actions.sql` and run it.
 5. Paste `supabase/seed.sql` and run it.
+6. Paste `0004_portal_and_team.sql` and run it (booking portal, team invites, live dispatch).
 
 If any step errors, copy the full error text back to Claude. Do not edit the SQL yourself.
 
