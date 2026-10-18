@@ -11,6 +11,8 @@ Do this in the Supabase dashboard for your project. Keep the service role key ou
 5. Paste `supabase/seed.sql` and run it.
 6. Paste `0004_portal_and_team.sql` and run it (booking portal, team invites, live dispatch).
 7. Paste `0005_driver_app_access.sql` and run it (app access for existing drivers).
+8. Paste `0006_platform_admin.sql` and run it (super admin, company status and type).
+9. Make yourself super admin: `insert into platform_admins (user_id) select id from auth.users where email = 'YOUR_EMAIL';`
 
 If any step errors, copy the full error text back to Claude. Do not edit the SQL yourself.
 
