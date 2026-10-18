@@ -216,5 +216,29 @@ check('travel agency can self sign-up', (await as('00000000-0000-0000-0000-00000
 check('self sign-up still defaults to operator', (await as(BOSS, `select kind from orgs where id = $1`, [a])).rows[0].kind === 'operator');
 check('admin cannot be added by app users', await fails(U.alpha, `insert into platform_admins (user_id) values ($1)`, [U.alpha]));
 
+console.log('Stripe payments');
+check('owner cannot mark own Stripe as ready', await fails(U.alpha, `update orgs set stripe_charges_enabled = true where id = $1`, [a]));
+await as(U.alpha, `update orgs set deposit_percent = 30 where id = $1`, [a]);
+const due0 = (await as(U.alpha, `select booking_amount_due($1) d`, [bk])).rows[0].d;
+check('amount due on a paid booking is zero', Number(due0.balance) === 0 && Number(due0.deposit_due) === 0, JSON.stringify(due0));
+const nb = (await as(U.alpha, `select create_booking($1,$2,'Card Payer',null,'one_way',$3, now() + interval '4 days','A','B',30,0) id`, [a, contact, sedanA])).rows[0].id;
+const due1 = (await as(U.alpha, `select booking_amount_due($1) d`, [nb])).rows[0].d;
+check('30% deposit of 135.60 is 40.68', Number(due1.deposit_due) === 40.68 && Number(due1.balance) === 135.6 && due1.card_payments_ready === false, JSON.stringify(due1));
+// Server (service role, no auth.uid) marks Stripe ready and records a pending checkout, then the webhook settles it.
+await db.query(`select set_config('request.jwt.claim.sub', '', false)`);
+await db.query(`update orgs set stripe_account_id = 'acct_test', stripe_charges_enabled = true where id = $1`, [a]);
+await db.query(`insert into payments (org_id, booking_id, provider, provider_ref, amount, currency, status, kind) values ($1,$2,'stripe','cs_test_1',40.68,'CAD','pending','deposit')`, [a, nb]);
+check('pending payment does not count as paid', (await as(U.alpha, `select payment_status from bookings where id = $1`, [nb])).rows[0].payment_status === 'unpaid');
+await db.query(`update payments set status = 'succeeded' where provider_ref = 'cs_test_1'`);
+const after = (await as(U.alpha, `select payment_status, paid_amount::float p from bookings where id = $1`, [nb])).rows[0];
+check('webhook success marks deposit paid', after.payment_status === 'partial' && after.p === 40.68, JSON.stringify(after));
+check('duplicate checkout reference rejected', await (async () => { try { await db.query(`insert into payments (org_id, booking_id, provider, provider_ref, amount, currency) values ($1,$2,'stripe','cs_test_1',1,'CAD')`, [a, nb]); return false; } catch { return true; } })());
+const nbCode = (await as(U.alpha, `select public_code from bookings where id = $1`, [nb])).rows[0].public_code;
+const pst = (await asAnon(`select public_booking_status('alpha', $1) s`, [nbCode])).rows[0].s;
+check('status page shows balance and card readiness', pst && Number(pst.balance) === 94.92 && pst.card_payments_ready === true, JSON.stringify(pst));
+check('non-admin cannot change platform fee', (await as(U.alpha, `update platform_settings set platform_fee_bps = 500 returning 1`)).rows.length === 0);
+await as(BOSS, `update platform_settings set platform_fee_bps = 100`);
+check('super admin sets platform fee', (await db.query(`select platform_fee_bps from platform_settings`)).rows[0].platform_fee_bps === 100);
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

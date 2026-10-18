@@ -1,0 +1,13 @@
+# Supabase CLI settings used when deploying edge functions.
+project_id = "jtfdgxiiwysxdjhxymmm"
+
+# These functions check the caller themselves (or are called by Stripe / signed-out customers),
+# so the gateway's own token check is switched off.
+[functions.stripe-connect]
+verify_jwt = false
+
+[functions.stripe-checkout]
+verify_jwt = false
+
+[functions.stripe-webhook]
+verify_jwt = false
