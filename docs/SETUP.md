@@ -14,7 +14,8 @@ Do this in the Supabase dashboard for your project. Keep the service role key ou
 8. Paste `0006_platform_admin.sql` and run it (super admin, company status and type).
 9. Paste `0007_stripe.sql` and run it (card payments). Then follow `docs/STRIPE_SETUP.md`.
 10. Paste `0008_tax_precision.sql` and run it (exact Quebec tax rate).
-11. Make yourself super admin: `insert into platform_admins (user_id) select id from auth.users where email = 'YOUR_EMAIL';`
+11. Paste `0009_ops_depth.sql` and run it (customer web sign-in, re-price, cancel with reason).
+12. Make yourself super admin: `insert into platform_admins (user_id) select id from auth.users where email = 'YOUR_EMAIL';`
 
 If any step errors, copy the full error text back to Claude. Do not edit the SQL yourself.
 

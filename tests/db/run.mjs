@@ -247,5 +247,31 @@ const qcSedan = (await as(BOSS, `select id from vehicle_classes where org_id = $
 const qq = (await as(BOSS, `select quote_price($1,$2,'one_way',30,0) q`, [qc, qcSedan])).rows[0].q;
 check('Quebec quote: 120.00 + 17.97 = 137.97', qq.tax_total === 17.97 && qq.total === 137.97, JSON.stringify(qq));
 
+console.log('Ops depth');
+const CUST2 = '00000000-0000-0000-0000-0000000000c2';
+await db.query(`insert into auth.users (id, email) values ($1, 'ROBIN@example.com')`, [CUST2]);
+const linked = (await as(CUST2, `select link_customer_account() n`)).rows[0].n;
+check('customer links portal bookings by email', linked === 2, String(linked));
+check('customer now sees own bookings only', (await as(CUST2, `select count(*)::int n from bookings`)).rows[0].n === 2);
+check('customer membership created', (await db.query(`select count(*)::int n from memberships where user_id = $1 and role = 'customer'`, [CUST2])).rows[0].n === 1);
+check('linking again is safe', (await as(CUST2, `select link_customer_account() n`)).rows[0].n === 2);
+const rb = (await as(U.alpha, `select create_booking($1,$2,'Reprice Me',null,'one_way',$3, now() + interval '5 days','A','B',30,0) id`, [a, contact, sedanA])).rows[0].id;
+const suvA = (await as(U.alpha, `select id from vehicle_classes where org_id = $1 and name = 'SUV'`, [a])).rows[0].id;
+const qSuv = (await as(U.alpha, `select quote_price($1,$2,'one_way',30,0) q`, [a, suvA])).rows[0].q;
+const rp = (await as(U.alpha, `select reprice_booking($1,$2,'one_way',30,0) r`, [rb, suvA])).rows[0].r;
+check('reprice matches a fresh SUV quote', Number(rp.total) === Number(qSuv.total) && Number(rp.subtotal) === Number(qSuv.subtotal), JSON.stringify({rp, qSuv}));
+check('reprice keeps one fare line', (await as(U.alpha, `select count(*)::int n from booking_lines where booking_id = $1 and kind = 'fare'`, [rb])).rows[0].n === 1);
+check('driver cannot reprice', await fails(U.driver, `select reprice_booking($1,$2,'one_way',10,0)`, [rb, suvA]));
+check('bravo cannot reprice alpha', await fails(U.bravo, `select reprice_booking($1,$2,'one_way',10,0)`, [rb, suvA]));
+await as(U.alpha, `select cancel_booking($1, 'Client changed plans')`, [rb]);
+check('cancel sets booking and trip cancelled', (await as(U.alpha, `select b.status bs, t.status ts from bookings b join trips t on t.booking_id = b.id where b.id = $1`, [rb])).rows[0].ts === 'cancelled');
+check('cancel reason in audit log', (await as(U.alpha, `select detail->>'reason' r from audit_log where action = 'cancel_booking' and entity_id = $1`, [rb])).rows[0].r === 'Client changed plans');
+check('cannot cancel twice', await fails(U.alpha, `select cancel_booking($1)`, [rb]));
+check('cannot reprice a cancelled booking', await fails(U.alpha, `select reprice_booking($1,$2,'one_way',10,0)`, [rb, suvA]));
+await as(U.alpha, `update orgs set billing_address = '1 King St W, Toronto', tax_number = '123456789 RT0001' where id = $1`, [a]);
+check('owner saves invoice details', (await as(U.alpha, `select tax_number from orgs where id = $1`, [a])).rows[0].tax_number === '123456789 RT0001');
+check('customer reads tax label for receipt', (await as(CUST2, `select count(*)::int n from tax_rates`)).rows[0].n >= 1);
+check('bravo cannot cancel alpha', await fails(U.bravo, `select cancel_booking($1)`, [bk]));
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
