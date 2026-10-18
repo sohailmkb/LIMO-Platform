@@ -155,5 +155,18 @@ const tm = (await as(U.alpha, `select email, role from team_members($1)`, [a])).
 check('team list shows emails', tm.some(r => r.email === 'newdriver@test.com' && r.role === 'driver'));
 check('bravo cannot list alpha team', (await as(U.bravo, `select count(*)::int n from team_members($1)`, [a])).rows[0].n === 0);
 
+console.log('Driver app access');
+await db.query(`insert into auth.users (id, email) values ('00000000-0000-0000-0000-0000000000d3', 'later@test.com')`);
+const dl = (await as(U.alpha, `insert into drivers (org_id, full_name) values ($1, 'Lee Later') returning id`, [a])).rows[0].id;
+check('link existing driver', (await as(U.alpha, `select grant_driver_app_access($1,'LATER@test.com') r`, [dl])).rows[0].r === 'linked');
+check('no duplicate driver row', (await as(U.alpha, `select count(*)::int n from drivers where full_name='Lee Later'`)).rows[0].n === 1);
+check('driver membership created', (await db.query(`select count(*)::int n from memberships where user_id='00000000-0000-0000-0000-0000000000d3' and role='driver'`)).rows[0].n === 1);
+check('repeat returns already_linked', (await as(U.alpha, `select grant_driver_app_access($1,'later@test.com') r`, [dl])).rows[0].r === 'already_linked');
+check('unknown email returns no_account', (await as(U.alpha, `select grant_driver_app_access($1,'ghost@test.com') r`, [dl])).rows[0].r === 'no_account');
+const d2 = (await as(U.alpha, `insert into drivers (org_id, full_name) values ($1, 'Other Driver') returning id`, [a])).rows[0].id;
+check('account already used by another driver', (await as(U.alpha, `select grant_driver_app_access($1,'later@test.com') r`, [d2])).rows[0].r === 'account_used_by_other_driver');
+check('driver cannot grant access', await fails(U.driver, `select grant_driver_app_access($1,'x@test.com')`, [d2]));
+check('bravo cannot grant on alpha driver', await fails(U.bravo, `select grant_driver_app_access($1,'later@test.com')`, [d2]));
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

@@ -10,6 +10,7 @@ Do this in the Supabase dashboard for your project. Keep the service role key ou
 4. Paste `0003_security_and_actions.sql` and run it.
 5. Paste `supabase/seed.sql` and run it.
 6. Paste `0004_portal_and_team.sql` and run it (booking portal, team invites, live dispatch).
+7. Paste `0005_driver_app_access.sql` and run it (app access for existing drivers).
 
 If any step errors, copy the full error text back to Claude. Do not edit the SQL yourself.
 
