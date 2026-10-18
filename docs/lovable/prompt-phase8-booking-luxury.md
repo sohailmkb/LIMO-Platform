@@ -2,7 +2,7 @@
 
 Before pasting:
 1. Run `supabase/migrations/0010_booking_depth.sql` in the Supabase SQL Editor (Lovable regenerates its types from the live database, so this comes first).
-2. Optional but recommended: set up maps (`docs/MAPS_SETUP.md`). Without it the address fields still work as plain text and distance is typed by hand.
+2. Maps use free OpenStreetMap services for now (no key, nothing to set up). Google can replace them later by changing one file; see `docs/MAPS_SETUP.md`.
 
 Paste the block below as one message, in normal mode.
 
@@ -34,15 +34,20 @@ Principles, taken from Aman, Four Seasons and Blacklane: restraint over decorati
 - Today page: greeting in serif with the time of day and the user's first name ("Good evening, Sohail"), KPI tiles with eyebrow labels.
 - EmptyState title in font-display text-xl.
 
-2. ADDRESS SEARCH AND DISTANCE
-New: src/components/app/address-field.tsx and src/lib/maps.ts.
-- Edge function "maps" (call with supabase.functions.invoke, works signed in or out):
-  {action:"autocomplete", input, session, lang, country} -> {suggestions:[{place_id, main, secondary}]}
-  {action:"details", place_id, session, lang} -> {address, lat, lng, name, airport}
-  {action:"route", points:[{lat,lng},...], depart_at} -> {km, miles, minutes}
-- AddressField: text input with a suggestion list (debounce 250 ms, min 3 chars, arrow keys and Enter, Escape closes). A new session id (crypto.randomUUID) per field focus, reused for the details call. Bias to the operator country. On pick, value becomes {address, lat, lng, airport}. If the function errors even once (maps not set up), stop calling it for the session and behave as a plain text field. No error toasts for this.
-- When pickup, drop-off and any stops all have coordinates, call route (points in order, depart_at = pickup time) and fill distance in the operator unit (km or miles) and show "About 26 min drive". Staff can still overwrite the distance; on the portal the distance field is hidden when it was filled from the map and shown as a normal input when it was not.
-- Use AddressField for pickup, drop-off and stops in: src/routes/_authenticated/_staff/bookings/new.tsx, src/components/app/booking-edit-dialog.tsx (pickup and drop-off only), src/routes/book.$slug.tsx.
+2. ADDRESS SEARCH, DISTANCE AND MAPS (free, no API key)
+New: src/lib/maps.ts, src/components/app/address-field.tsx, src/components/app/route-map.tsx. Add the npm package maplibre-gl (version 5).
+All map calls go through src/lib/maps.ts so we can switch to Google later by changing that one file. Export:
+  searchPlaces(input, {lang, near:{lat,lng}?, country?}) -> [{id, label, secondary, lat, lng, airport}]
+  routeBetween(points:[{lat,lng}]) -> {km, miles, minutes, line: GeoJSON LineString} | null
+Implementation now (free OpenStreetMap services, called straight from the browser):
+- Search: GET https://photon.komoot.io/api/?q={input}&limit=6&lang={en|fr|de, else omit}&lat={near.lat}&lon={near.lng}. Results are GeoJSON features; coordinates are [lng, lat]. label = name, or "housenumber street" when there is no name; secondary = city, state, country joined with commas. airport = properties.osm_key "aeroway" and osm_value "aerodrome" or "terminal". Drop duplicates by label + secondary. If the operator country is known, sort results in that country first.
+- Route: GET https://router.project-osrm.org/route/v1/driving/{lng,lat;lng,lat;...}?overview=full&geometries=geojson. distance is metres, duration is seconds. Times are typical driving times without live traffic: label them "About 32 min drive".
+- Be a good citizen: debounce search 350 ms, minimum 3 characters, cancel the previous request (AbortController), cache results in memory for the session, never call in a loop. If a call fails or times out (5 s), return [] or null silently and let the user type freely.
+- "near" for search bias: the operator's last used pickup coordinates if any, otherwise none.
+AddressField: text input with a suggestion list (arrow keys, Enter, Escape). On pick its value becomes {address, lat, lng, airport}. Typing after a pick clears lat and lng. It always works as plain text if no suggestion is chosen.
+Distance: when pickup, drop-off and any stops all have coordinates, call routeBetween (points in order) and fill distance in the operator unit (km or miles) plus "About N min drive". Staff can overwrite the distance. On the portal, hide the distance field when it was filled from the route and show it as a normal input when it was not.
+RouteMap: MapLibre map with the style https://tiles.openfreemap.org/styles/positron, markers for pickup (onyx), stops (grey) and drop-off (champagne, var(--gold)), the route line in onyx at 3 px, fitted to bounds with 40 px padding, no scroll zoom until clicked, 220 px tall on phones and 280 px on desktop, rounded with a hairline border. Keep MapLibre's attribution control visible (required by OpenStreetMap and OpenFreeMap) and add "Routing: OSRM" to it. Load the map lazily (dynamic import) so pages without a map stay light.
+Use AddressField for pickup, drop-off and stops in: src/routes/_authenticated/_staff/bookings/new.tsx, src/components/app/booking-edit-dialog.tsx (pickup and drop-off only), src/routes/book.$slug.tsx. Show RouteMap under the price on the staff new booking form, in the review step on the portal, and on the booking detail trip card when the trip has coordinates (fetch the route on view; show nothing if it fails).
 
 3. TRIP BUILDER (staff new booking and the portal)
 Files: bookings/new.tsx, book.$slug.tsx, src/lib/portal.functions.ts. New: src/lib/trip.ts (shared types and the JSON builder), src/components/app/price-breakdown.tsx.
@@ -93,7 +98,7 @@ File: src/routes/_authenticated/_staff/drivers/$id.tsx.
 
 ACCEPTANCE (check in code, then report)
 1. Login and the portal show the split-screen and hero designs; champagne appears only on the main action.
-2. Typing "Pearson" in pickup shows suggestions when maps are set up, and the field still works as plain text when they are not.
+2. Typing "Pearson" in pickup suggests Toronto Pearson International Airport (marked as an airport); choosing pickup and drop-off fills the distance and draws the route on the map; with the network blocked the field still works as plain text.
 3. A round trip with 2 stops, a child seat, promo SAVE10 and 15% gratuity shows the same total on the form as on the created booking.
 4. Portal request, then Send quote, then Accept and confirm on the status page, ends confirmed.
 5. Uploading a logo shows it on the portal, the invoice and the sidebar.
