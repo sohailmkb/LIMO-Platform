@@ -1,0 +1,58 @@
+{
+  "common": {
+    "signIn": "Sign in",
+    "signOut": "Sign out",
+    "email": "Email",
+    "password": "Password",
+    "loading": "Loading",
+    "switch": "Switch",
+    "error": "Something went wrong"
+  },
+  "setup": {
+    "title": "Setup needed",
+    "body": "Add EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY to apps/mobile/.env, then restart."
+  },
+  "picker": {
+    "title": "Choose a workspace",
+    "none": "Your account has no operator yet. Ask your operator to add you, or sign up on the web.",
+    "admin": "Operator",
+    "driver": "Driver",
+    "customer": "Customer"
+  },
+  "admin": {
+    "title": "Today",
+    "unassigned": "Unassigned",
+    "upcoming": "Upcoming trips",
+    "empty": "No upcoming trips"
+  },
+  "driver": {
+    "title": "My jobs",
+    "empty": "No jobs assigned",
+    "next": {
+      "en_route": "On my way",
+      "arrived": "I have arrived",
+      "on_board": "Passenger on board",
+      "completed": "Complete trip"
+    },
+    "noShow": "No show"
+  },
+  "customer": {
+    "title": "My trips",
+    "empty": "No trips yet",
+    "booking": "Booking"
+  },
+  "status": {
+    "unassigned": "Unassigned",
+    "offered": "Offered",
+    "assigned": "Assigned",
+    "en_route": "En route",
+    "arrived": "Arrived",
+    "on_board": "On board",
+    "completed": "Completed",
+    "no_show": "No show",
+    "cancelled": "Cancelled",
+    "quoted": "Quoted",
+    "confirmed": "Confirmed",
+    "in_progress": "In progress"
+  }
+}

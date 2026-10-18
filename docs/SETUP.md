@@ -1,0 +1,37 @@
+# Setup: first run on Supabase (about 15 minutes)
+
+Do this in the Supabase dashboard for your project. Keep the service role key out of chat and out of the repo.
+
+## 1. Run the database
+
+1. Open SQL Editor and create a new query.
+2. Paste `supabase/migrations/0001_core.sql` and run it.
+3. Paste `0002_operations.sql` and run it.
+4. Paste `0003_security_and_actions.sql` and run it.
+5. Paste `supabase/seed.sql` and run it.
+
+If any step errors, copy the full error text back to Claude. Do not edit the SQL yourself.
+
+## 2. Check it
+
+In Authentication, create two test users (one will be the operator, one a driver). Then in SQL Editor run:
+
+```sql
+select count(*) from plans;          -- expect 3
+select count(*) from tax_presets;    -- expect 13
+```
+
+## 3. Connect the mobile app
+
+1. In Project Settings, API: copy the Project URL and the anon public key.
+2. In `apps/mobile`, copy `.env.example` to `.env` and paste both values.
+3. From the repo root run `npm install`, then `cd apps/mobile && npx expo start`.
+4. Open the app in Expo Go on your phone and scan the code.
+
+## 4. Connect Lovable
+
+In Lovable, link the project to this Supabase project and this repo. Then paste the prompts in `docs/lovable/prompt-pack-1.md` one at a time, in order.
+
+## Database tests (optional, no Supabase needed)
+
+From the repo root: `npm run test:db`.

@@ -1,0 +1,58 @@
+{
+  "common": {
+    "signIn": "Se connecter",
+    "signOut": "Se déconnecter",
+    "email": "Courriel",
+    "password": "Mot de passe",
+    "loading": "Chargement",
+    "switch": "Changer",
+    "error": "Une erreur est survenue"
+  },
+  "setup": {
+    "title": "Configuration requise",
+    "body": "Ajoutez EXPO_PUBLIC_SUPABASE_URL et EXPO_PUBLIC_SUPABASE_ANON_KEY dans apps/mobile/.env, puis redémarrez."
+  },
+  "picker": {
+    "title": "Choisir un espace de travail",
+    "none": "Votre compte n'est lié à aucun exploitant. Demandez à votre exploitant de vous ajouter.",
+    "admin": "Exploitant",
+    "driver": "Chauffeur",
+    "customer": "Client"
+  },
+  "admin": {
+    "title": "Aujourd'hui",
+    "unassigned": "Non attribués",
+    "upcoming": "Courses à venir",
+    "empty": "Aucune course à venir"
+  },
+  "driver": {
+    "title": "Mes courses",
+    "empty": "Aucune course attribuée",
+    "next": {
+      "en_route": "Je suis en route",
+      "arrived": "Je suis arrivé",
+      "on_board": "Passager à bord",
+      "completed": "Terminer la course"
+    },
+    "noShow": "Passager absent"
+  },
+  "customer": {
+    "title": "Mes courses",
+    "empty": "Aucune course pour l'instant",
+    "booking": "Réservation"
+  },
+  "status": {
+    "unassigned": "Non attribuée",
+    "offered": "Proposée",
+    "assigned": "Attribuée",
+    "en_route": "En route",
+    "arrived": "Arrivé",
+    "on_board": "À bord",
+    "completed": "Terminée",
+    "no_show": "Passager absent",
+    "cancelled": "Annulée",
+    "quoted": "Devis",
+    "confirmed": "Confirmée",
+    "in_progress": "En cours"
+  }
+}

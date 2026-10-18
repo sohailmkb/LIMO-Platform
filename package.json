@@ -1,0 +1,9 @@
+{
+  "name": "limo-platform",
+  "private": true,
+  "workspaces": ["apps/mobile", "packages/shared"],
+  "scripts": {
+    "test:db": "npm --prefix tests/db install --no-audit --no-fund && npm --prefix tests/db test",
+    "typecheck": "npm --workspace apps/mobile run typecheck && npm --workspace packages/shared run typecheck"
+  }
+}
