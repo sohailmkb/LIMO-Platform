@@ -51,12 +51,20 @@ await db.exec(`
 `);
 
 console.log('Applying migrations');
+// seed.sql only touches tables 0001_core.sql creates (plans, currencies, locales, tax_presets)
+// and is meant to run once, early — on the real project it was applied right after 0001, long
+// before any later migration, so currencies/tax_presets/etc. are already there by the time any
+// of them runs. Applying it after every migration (the old order here) doesn't match that: it
+// let a later migration's own seed data (0015's fx_rates, seeded from currencies) silently race
+// against an empty currencies table that only this test harness would ever see.
 for (const f of readdirSync(join(root, 'migrations')).filter(f => f.endsWith('.sql')).sort()) {
   await db.exec(readFileSync(join(root, 'migrations', f), 'utf8'));
   console.log(`  applied ${f}`);
+  if (f === '0001_core.sql') {
+    await db.exec(readFileSync(join(root, 'seed.sql'), 'utf8'));
+    console.log('  applied seed.sql');
+  }
 }
-await db.exec(readFileSync(join(root, 'seed.sql'), 'utf8'));
-console.log('  applied seed.sql');
 
 for (const [k, id] of Object.entries(U)) await db.query('insert into auth.users (id, email) values ($1, $2)', [id, `${k}@test.com`]);
 await db.query(`insert into auth.users (id, email) values ('00000000-0000-0000-0000-0000000000d2', 'newdriver@test.com')`);
@@ -788,6 +796,39 @@ console.log('Moovs parity (0013)');
   const outsiderId = '00000000-0000-0000-0000-000000009999';
   await db.query(`insert into auth.users (id, email) values ($1, 'outsider@test.com')`, [outsiderId]);
   check('a non-member cannot search alpha\'s data', await fails(outsiderId, `select global_search($1,'Robin')`, [a]));
+}
+
+console.log('Currency and FX (0015)');
+{
+  // Alpha Limo (a) is CAD; the farm-out inserted earlier (line 122) carried no currency, so the
+  // trigger must have stamped it from the originating org, not left it null or copied the partner's.
+  const stamped = (await db.query(`select currency from farm_outs where from_org_id = $1 and to_org_id = $2`, [a, b])).rows[0];
+  check('an untagged farm-out is stamped with the originating org\'s currency', stamped?.currency === 'CAD', JSON.stringify(stamped));
+
+  // A farm-out that does specify a currency is left alone by the trigger.
+  const explicit = (await as(U.alpha, `insert into farm_outs (from_org_id, to_org_id, trip_id, partner_price, currency) values ($1,$2,$3,120,'EUR') returning currency`, [a, b, trip])).rows[0];
+  check('a farm-out that names its own currency keeps it', explicit.currency === 'EUR');
+
+  check('to_usd converts using the seeded rate', Number((await db.query(`select to_usd('CAD', 100) v`)).rows[0].v) === 73);
+  check('to_usd on an unknown currency code falls back to 1:1', (await db.query(`select to_usd('ZZZ', 50) v`)).rows[0].v == 50);
+
+  check('a non-admin cannot set an exchange rate', await fails(U.alpha, `select set_fx_rate('CAD', 0.80)`));
+  await as(BOSS, `select set_fx_rate('CAD', 0.80)`);
+  check('a platform admin can set an exchange rate, and to_usd picks it up', (await db.query(`select to_usd('CAD', 100) v`)).rows[0].v == 80);
+  check('set_fx_rate rejects a non-positive rate', await fails(BOSS, `select set_fx_rate('CAD', 0)`));
+
+  const ov = (await as(BOSS, `select platform_overview() o`)).rows[0].o;
+  check('platform_overview adds a combined USD total alongside the per-currency breakdown', typeof ov.booking_value_30d === 'object' && typeof ov.booking_value_30d_usd === 'number', JSON.stringify(ov.booking_value_30d_usd));
+
+  const companies = (await as(BOSS, `select * from platform_companies()`)).rows;
+  check('platform_companies reports a USD-converted revenue figure per company', companies.every((c) => Number.isFinite(Number(c.revenue_30d_usd))), JSON.stringify(companies.map((c) => c.revenue_30d_usd)));
+
+  check('a non-admin cannot change a company\'s currency', await fails(U.alpha, `select platform_set_org_currency($1, 'USD')`, [a]));
+  check('platform_set_org_currency rejects an unknown currency', await fails(BOSS, `select platform_set_org_currency($1, 'ZZZ')`, [a]));
+  await as(BOSS, `select platform_set_org_currency($1, 'USD')`, [a]);
+  check('a platform admin can change a company\'s currency after signup', (await db.query(`select default_currency from orgs where id = $1`, [a])).rows[0].default_currency === 'USD');
+  // Put it back so later-numbered checks elsewhere in this file that assume CAD still pass.
+  await as(BOSS, `select platform_set_org_currency($1, 'CAD')`, [a]);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
