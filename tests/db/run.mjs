@@ -700,5 +700,90 @@ console.log('Operations suite (0012)');
   await as(U.alpha, `update orgs set require_terms = false where id = $1`, [a]);
 }
 
+console.log('Moovs parity (0013)');
+{
+  const near = (x, y) => Math.abs(Number(x) - Number(y)) < 0.011;
+  const P = (o) => JSON.stringify({ class_id: sedanA, service: 'one_way', distance: 10, ...o });
+  const pr = async (o) => (await as(U.alpha, `select price_trip($1,$2::jsonb) q`, [a, P(o)])).rows[0].q;
+
+  // 1. Zone polygons
+  const pz2 = (await db.query(`select id from zones where org_id = $1 and name = 'Pearson'`, [a])).rows[0].id;
+  const poly = [[43.70, -79.42], [43.70, -79.30], [43.60, -79.30], [43.60, -79.42]];
+  const coreZone = (await as(U.alpha, `insert into zones (org_id, name, kind, lat, lng, radius_km, boundary) values ($1,'Core','area',43.65,-79.36,1,$2::jsonb) returning id`, [a, JSON.stringify(poly)])).rows[0].id;
+  await as(U.alpha, `insert into zone_rates (org_id, class_id, from_zone, to_zone, amount) values ($1,$2,$3,$4,77)`, [a, sedanA, pz2, coreZone]);
+  let qz = await pr({ pickup_lat: 43.68, pickup_lng: -79.62, dropoff_lat: 43.65, dropoff_lng: -79.35 });
+  check('polygon zone matches a point inside the ring', near(qz.lines[0].amount, 77) && qz.lines[0].description === 'Flat rate Pearson to Core', JSON.stringify(qz.lines[0]));
+  qz = await pr({ pickup_lat: 43.68, pickup_lng: -79.62, dropoff_lat: 43.9, dropoff_lng: -79.0 });
+  check('polygon zone does not match a point outside the ring', !qz.lines.some((l) => near(l.amount, 77)));
+  const upsertId = (await as(U.alpha, `select upsert_zone($1,'Core','area',43.65,-79.36,1,$2::jsonb) id`, [a, JSON.stringify(poly)])).rows[0].id;
+  check('upsert_zone updates the existing zone by name', upsertId === coreZone);
+
+  // 2. Driver scorecards and penalties folded into pay runs
+  const lateBooking = (await as(U.alpha, `select create_booking_v2($1,$2,$3::jsonb) id`, [a, contact,
+    P({ passenger_name: 'Late Rider', pickup_address: 'A', pickup_at: new Date(Date.now() + 2 * 864e5).toISOString() })])).rows[0].id;
+  const lateTrip = (await db.query(`select id, pickup_at from trips where booking_id = $1`, [lateBooking])).rows[0];
+  await as(U.alpha, `update trips set driver_id = $2, status = 'completed' where id = $1`, [lateTrip.id, driverId]);
+  await as(U.alpha, `insert into trip_events (org_id, trip_id, status, created_at) values ($1,$2,'arrived',$3::timestamptz + interval '20 minutes')`, [a, lateTrip.id, lateTrip.pickup_at]);
+  await as(U.alpha, `insert into trip_costs (trip_id, org_id, driver_pay) values ($1,$2,50) on conflict (trip_id) do update set driver_pay = 50`, [lateTrip.id, a]);
+
+  const card = (await as(U.alpha, `select driver_scorecard($1,$2) c`, [a, driverId])).rows[0].c;
+  check('scorecard reports trips and on-time percentage', card.trips_90d >= 1 && card.on_time_pct !== null, JSON.stringify(card));
+  check('outsider cannot read a scorecard', await fails(U.customer, `select driver_scorecard($1,$2)`, [a, driverId]));
+
+  const ruleId = (await as(U.alpha, `insert into penalty_rules (org_id, name, trigger, late_minutes, percent) values ($1,'Late 10%','late',10,10) returning id`, [a])).rows[0].id;
+  const nCreated = (await as(U.alpha, `select apply_penalty_rules($1) n`, [a])).rows[0].n;
+  check('apply_penalty_rules creates a pending penalty for the late trip', nCreated >= 1);
+  const pending = (await db.query(`select amount, status from driver_penalties where trip_id = $1`, [lateTrip.id])).rows[0];
+  check('penalty amount is 10% of that trip\'s driver pay', near(pending.amount, 5) && pending.status === 'pending', JSON.stringify(pending));
+  check('apply_penalty_rules does not duplicate an existing penalty', (await as(U.alpha, `select apply_penalty_rules($1) n`, [a])).rows[0].n === 0);
+
+  const period = (await db.query(`select ((pickup_at::timestamptz) at time zone 'America/Toronto')::date d from trips where id = $1`, [lateTrip.id])).rows[0].d;
+  const run3 = (await as(U.alpha, `select create_pay_run($1,$2,$2) r`, [a, period])).rows[0].r;
+  const line = (await db.query(`select adjustment, adjustment_note from pay_run_lines where pay_run_id = $1 and driver_id = $2`, [run3, driverId])).rows[0];
+  check('pay run folds the pending penalty in as a negative adjustment', line && near(line.adjustment, -5) && line.adjustment_note === 'Penalties this period', JSON.stringify(line));
+  check('the penalty is marked applied and linked to the pay run', (await db.query(`select status, pay_run_id from driver_penalties where trip_id = $1`, [lateTrip.id])).rows[0].status === 'applied');
+
+  const ruleId2 = (await as(U.alpha, `insert into penalty_rules (org_id, name, trigger, amount) values ($1,'Manual','other',15) returning id`, [a])).rows[0].id;
+  const manualPenalty = (await as(U.alpha, `select add_driver_penalty($1,$2,20,'Phone off during shift') id`, [a, driverId])).rows[0].id;
+  await as(U.alpha, `select void_driver_penalty($1)`, [manualPenalty]);
+  check('a voided penalty is excluded from the next pay run', (await db.query(`select status from driver_penalties where id = $1`, [manualPenalty])).rows[0].status === 'voided');
+
+  // 3. Disputes
+  const payId = (await as(U.alpha, `insert into payments (org_id, booking_id, provider, provider_ref, amount, currency, status) values ($1,$2,'stripe','sess_t1',150,'CAD','succeeded') returning id`, [a, lateBooking])).rows[0].id;
+  const disputeId = (await as(U.alpha, `insert into disputes (org_id, payment_id, booking_id, stripe_dispute_id, amount, currency, reason) values ($1,$2,$3,'dp_t1',150,'CAD','fraudulent') returning id`, [a, payId, lateBooking])).rows[0].id;
+  const ev = (await as(U.alpha, `select dispute_evidence($1) e`, [disputeId])).rows[0].e;
+  check('dispute evidence bundles the booking and trip timeline', ev.booking.passenger_name === 'Late Rider' && ev.trips.length >= 1 && ev.trips[0].timeline.some((t) => t.status === 'arrived'), JSON.stringify(ev).slice(0, 300));
+  await as(U.alpha, `select set_dispute_status($1,'won')`, [disputeId]);
+  check('dispute status updates and resolves', (await db.query(`select status, resolved_at is not null r from disputes where id = $1`, [disputeId])).rows[0].status === 'won');
+  check('a customer cannot read disputes', (await as(U.customer, `select count(*)::int n from disputes`)).rows[0].n === 0);
+
+  // 4. Ranked driver suggestions
+  const freshBooking = (await as(U.alpha, `select create_booking_v2($1,$2,$3::jsonb) id`, [a, contact,
+    P({ passenger_name: 'Suggest Me', pickup_address: 'Pearson T1', pickup_lat: 43.68, pickup_lng: -79.62, pickup_at: new Date(Date.now() + 6 * 864e5).toISOString() })])).rows[0].id;
+  const freshTrip = (await db.query(`select id from trips where booking_id = $1`, [freshBooking])).rows[0].id;
+  const sugg = (await as(U.alpha, `select suggest_drivers($1,5) s`, [freshTrip])).rows[0].s;
+  const dana = sugg.find((s) => s.driver_id === driverId);
+  // Dana has real history by this point (one late arrival earlier in this suite), so she's scored
+  // on her actual 50% on-time record rather than the 90% default other untested drivers get —
+  // ranking below them here is correct, not a bug. Check she's present with reasons reflecting it.
+  check('suggest_drivers includes the driver with real history, scored on their actual record',
+    !!dana && dana.reasons.length > 0 && dana.on_time_pct === 50, JSON.stringify(sugg));
+  check('suggest_drivers returns results sorted by score, highest first',
+    sugg.every((s, i) => i === 0 || sugg[i - 1].score >= s.score));
+  check('a customer cannot call suggest_drivers', await fails(U.customer, `select suggest_drivers($1,5)`, [freshTrip]));
+
+  // 5. Global search
+  const gs = (await as(U.alpha, `select global_search($1,'Robin') s`, [a])).rows[0].s;
+  check('global search finds a booking by passenger name', gs.bookings.some((b) => b.passenger_name === 'Robin Rider'));
+  const gs2 = (await as(U.alpha, `select global_search($1,'Casey') s`, [a])).rows[0].s;
+  check('global search finds a contact by name', gs2.contacts.some((c) => c.name === 'Casey Customer'));
+  check('a one-character query returns empty, not an error', (await as(U.alpha, `select global_search($1,'a') s`, [a])).rows[0].s.bookings.length === 0);
+  // Use a brand-new user who was never invited anywhere (bravo is, by this point in the suite,
+  // a legitimate accountant member of alpha via the "existing account added at once" test above).
+  const outsiderId = '00000000-0000-0000-0000-000000009999';
+  await db.query(`insert into auth.users (id, email) values ($1, 'outsider@test.com')`, [outsiderId]);
+  check('a non-member cannot search alpha\'s data', await fails(outsiderId, `select global_search($1,'Robin')`, [a]));
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

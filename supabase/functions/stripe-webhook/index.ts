@@ -57,6 +57,29 @@ Deno.serve(async (req) => {
         }
         break;
       }
+      case "charge.dispute.created": {
+        const d = event.data.object as Stripe.Dispute;
+        const pi = typeof d.payment_intent === "string" ? d.payment_intent : d.payment_intent?.id;
+        const { data: payment } = await admin.from("payments")
+          .select("id, org_id, booking_id").eq("provider", "stripe").eq("payment_intent", pi ?? "").maybeSingle();
+        if (payment) {
+          await admin.from("disputes").upsert({
+            org_id: payment.org_id, payment_id: payment.id, booking_id: payment.booking_id,
+            stripe_dispute_id: d.id, amount: d.amount / 100, currency: d.currency.toUpperCase(),
+            reason: d.reason, status: "needs_response",
+            evidence_due_by: d.evidence_details?.due_by ? new Date(d.evidence_details.due_by * 1000).toISOString() : null,
+          }, { onConflict: "stripe_dispute_id" });
+        }
+        break;
+      }
+      case "charge.dispute.closed": {
+        const d = event.data.object as Stripe.Dispute;
+        const status = d.status === "won" ? "won" : d.status === "lost" ? "lost" : "under_review";
+        await admin.from("disputes")
+          .update({ status, resolved_at: status === "won" || status === "lost" ? new Date().toISOString() : null })
+          .eq("stripe_dispute_id", d.id);
+        break;
+      }
       case "account.updated": {
         const a = event.data.object as Stripe.Account;
         await admin.from("orgs").update({
