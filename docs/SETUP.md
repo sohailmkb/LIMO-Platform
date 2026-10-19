@@ -17,7 +17,8 @@ Do this in the Supabase dashboard for your project. Keep the service role key ou
 11. Paste `0009_ops_depth.sql` and run it (customer web sign-in, re-price, cancel with reason).
 12. Paste `0010_booking_depth.sql` and run it (round trips, stops, extras, promo codes, quotes, branding). For address search see `docs/MAPS_SETUP.md`.
 13. Paste `0011_access.sql` and run it (invitations, roles for every portal, suspension).
-14. Make yourself platform owner. This works whether or not that email has signed up yet:
+14. Paste `0012_ops_suite.sql` and run it (pricing rules, invoices, payroll, recurring, availability, compliance, ratings, notifications, terms).
+15. Make yourself platform owner. This works whether or not that email has signed up yet:
     `select app.bootstrap_platform_owner('YOUR_ADMIN_EMAIL');`
     It answers "granted now" or "will be granted when ... signs in".
 

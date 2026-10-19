@@ -503,5 +503,202 @@ console.log('Users and access (0011)');
   check('company sign-up still makes the founder owner', !!(await as(uid(4), `select create_operator('Late Limo','late-limo','CA','CAD','en','America/Toronto','metric',false,'CA-ON-HST') id`)).rows[0].id);
 }
 
+console.log('Operations suite (0012)');
+{
+  const near = (x, y) => Math.abs(Number(x) - Number(y)) < 0.011;
+  const local = async (d) => (await db.query(`select (($1)::timestamp at time zone 'America/Toronto') t`, [d])).rows[0].t.toISOString();
+  const P = (o) => JSON.stringify({ class_id: sedanA, service: 'one_way', distance: 27, ...o });
+  const pr = async (o) => (await as(U.alpha, `select price_trip($1,$2::jsonb) q`, [a, P(o)])).rows[0].q;
+  const OUT = 'x0000000-0000-0000-0000-0000000001ee'.replace('x', '0');
+  await db.query(`insert into auth.users (id, email) values ($1, 'outsider@test.com')`, [OUT]);
+  const book = async (o) => (await as(U.alpha, `select create_booking_v2($1,$2,$3::jsonb) id`, [a, contact,
+    P({ passenger_name: 'Robin Rider', passenger_phone: '+14165550123', pickup_address: 'Pearson T1', dropoff_address: 'Union Station', ...o })])).rows[0].id;
+
+  // 1. Pricing rules
+  const pz = (await as(U.alpha, `insert into zones (org_id, name, kind, lat, lng, radius_km) values ($1,'Pearson','airport',43.6777,-79.6248,3) returning id`, [a])).rows[0].id;
+  const dz = (await as(U.alpha, `insert into zones (org_id, name, lat, lng, radius_km) values ($1,'Downtown',43.6487,-79.3817,3) returning id`, [a])).rows[0].id;
+  await as(U.alpha, `insert into zone_rates (org_id, class_id, from_zone, to_zone, amount) values ($1,$2,$3,$4,95)`, [a, sedanA, pz, dz]);
+  const AP = { pickup_lat: 43.68, pickup_lng: -79.62, dropoff_lat: 43.65, dropoff_lng: -79.38 };
+  let q = await pr(AP);
+  check('zone flat rate replaces the distance fare', near(q.lines[0].amount, 95) && q.lines[0].description === 'Flat rate Pearson to Downtown' && q.zone.from === 'Pearson', JSON.stringify(q.lines[0]));
+  q = await pr({ pickup_lat: 43.65, pickup_lng: -79.38, dropoff_lat: 43.68, dropoff_lng: -79.62 });
+  check('flat rate works in the other direction', near(q.lines[0].amount, 95));
+  q = await pr({ pickup_lat: 43.9, pickup_lng: -79.0, dropoff_lat: 43.65, dropoff_lng: -79.38 });
+  check('outside the zones the distance fare applies', near(q.lines[0].amount, 114));
+  q = await pr({ service: 'hourly', hours: 4, distance: 0 });
+  check('hourly quotes still work and report the minimum', near(q.lines[0].amount, 300) && Number(q.min_hours) === 3, JSON.stringify(q.lines));
+  await as(U.alpha, `update orgs set airport_fee = 10 where id = $1`, [a]);
+  q = await pr(AP);
+  check('airport zone adds the airport fee', q.lines.some(l => l.code === 'airport' && near(l.amount, 10)));
+  q = await pr({ ...AP, round_trip: true });
+  check('round trip pays the airport fee twice', q.lines.some(l => l.code === 'airport' && near(l.amount, 20)));
+  q = await pr({ pickup_airport: true });
+  check('airport flag from address search adds the fee', q.lines.some(l => l.code === 'airport'));
+  await as(U.alpha, `update orgs set airport_fee = 0 where id = $1`, [a]);
+  await as(U.alpha, `insert into price_rules (org_id, name, start_time, end_time, adjust_type, amount) values ($1,'Night',  '22:00','06:00','percent',20)`, [a]);
+  await as(U.alpha, `insert into price_rules (org_id, name, date_from, date_to, adjust_type, amount) values ($1,'New Year''s Eve','2026-12-31','2026-12-31','fixed',25)`, [a]);
+  await as(U.alpha, `insert into price_rules (org_id, name, days, adjust_type, amount) values ($1,'Weekend',array[0,6],'percent',10)`, [a]);
+  q = await pr({ pickup_at: await local('2026-12-02 23:30') });
+  check('night rule applies at 23:30 local (wraps midnight)', q.lines.some(l => l.code === 'rule' && l.description === 'Night' && near(l.amount, 22.8)), JSON.stringify(q.lines));
+  q = await pr({ pickup_at: await local('2026-12-03 05:59') });
+  check('night rule applies at 05:59', q.lines.some(l => l.description === 'Night'));
+  q = await pr({ pickup_at: await local('2026-12-02 12:00') });
+  check('no rule at noon on a weekday', !q.lines.some(l => l.code === 'rule'));
+  q = await pr({ pickup_at: await local('2026-12-31 12:00') });
+  check('holiday date adds its fixed amount', q.lines.some(l => l.description === "New Year's Eve" && near(l.amount, 25)));
+  q = await pr({ pickup_at: await local('2026-12-05 12:00') });
+  check('weekend rule on a Saturday', q.lines.some(l => l.description === 'Weekend' && near(l.amount, 11.4)));
+  await as(U.alpha, `update price_rules set active = false where org_id = $1`, [a]);
+
+  // Charges after the trip
+  await as(U.alpha, `update orgs set wait_per_minute = 1.5, cancel_fee_percent = 50 where id = $1`, [a]);
+  const b1 = await book({ pickup_at: new Date(Date.now() + 5 * 864e5).toISOString() });
+  const t0 = Number((await db.query(`select total from bookings where id = $1`, [b1])).rows[0].total);
+  const after = (await as(U.alpha, `select add_trip_charges($1, $2::jsonb) r`, [b1, JSON.stringify([{ kind: 'wait', minutes: 15 }, { kind: 'toll', amount: 6.25 }])])).rows[0].r;
+  check('waiting time (taxed) and tolls (untaxed) are added', near(Number(after.total) - t0, 22.5 * 1.13 + 6.25), `${after.total} vs ${t0}`);
+  check('accountant can add charges', !(await fails(U.bravo, `select add_trip_charges($1,'[{"kind":"parking","amount":10}]'::jsonb)`, [b1])));
+  check('driver cannot add charges', await fails(U.driver, `select add_trip_charges($1,'[{"kind":"toll","amount":5}]'::jsonb)`, [b1]));
+  check('a charge needs an amount', await fails(U.alpha, `select add_trip_charges($1,'[{"kind":"other"}]'::jsonb)`, [b1]));
+
+  // Cancellation fees
+  const late = await book({ pickup_at: new Date(Date.now() + 2 * 3600e3).toISOString() });
+  const terms = (await as(U.alpha, `select cancellation_terms($1) r`, [late])).rows[0].r;
+  check('cancellation terms say it is late, fee 50% of fare', terms.late === true && near(terms.late_fee, 57));
+  check('fee needs the booking cancelled first', await fails(U.alpha, `select charge_cancellation($1,'late_cancel')`, [late]));
+  await as(U.alpha, `select cancel_booking($1,'Client cancelled late')`, [late]);
+  const fee = (await as(U.alpha, `select charge_cancellation($1,'late_cancel') r`, [late])).rows[0].r;
+  check('late cancellation leaves only the fee plus tax', near(fee.total, 57 * 1.13), JSON.stringify(fee));
+  check('no-show fee needs a no-show trip', await fails(U.alpha, `select charge_cancellation($1,'no_show')`, [b1]));
+
+  // 2. Vehicle showcase
+  await as(U.alpha, `update vehicle_classes set description = 'Mercedes E-Class or similar', amenities = array['Wi-Fi','Water'], photo_urls = array['https://x/e.jpg'] where id = $1`, [sedanA]);
+  const op = (await asAnon(`select public_operator('alpha') o`)).rows[0].o;
+  const sedanPub = op.classes.find(c => c.id === sedanA);
+  check('booking page shows class description, amenities and photos', sedanPub.description.startsWith('Mercedes') && sedanPub.amenities.length === 2 && sedanPub.photo_urls.length === 1);
+  check('too many photos rejected', await fails(U.alpha, `update vehicle_classes set photo_urls = array['1','2','3','4','5','6','7'] where id = $1`, [sedanA]));
+
+  // 3. Customer records
+  await as(U.alpha, `update contacts set tags = array['corporate'], vip = true, preferences = 'Still water, no talking' where id = $1`, [contact]);
+  await as(U.alpha, `insert into notes (org_id, contact_id, body) values ($1,$2,'Prefers Dana as driver')`, [a, contact]);
+  await as(U.alpha, `insert into notes (org_id, booking_id, body) values ($1,$2,'Gate code 4412')`, [a, b1]);
+  check('staff read private notes', (await as(U.alpha, `select count(*)::int n from notes`)).rows[0].n === 2);
+  check('accountant reads notes', (await as(U.bravo, `select count(*)::int n from notes where org_id = $1`, [a])).rows[0].n === 2);
+  check('customer never sees notes', (await as(U.customer, `select count(*)::int n from notes`)).rows[0].n === 0);
+  check('driver never sees notes', (await as(U.driver, `select count(*)::int n from notes`)).rows[0].n === 0);
+
+  // 4. Corporate billing
+  const globex = (await as(U.alpha, `insert into accounts (org_id, name, payment_terms_days) values ($1,'Globex',15) returning id`, [a])).rows[0].id;
+  const g1 = await book({ pickup_at: await local('2026-11-10 09:00') });
+  const g2 = await book({ pickup_at: await local('2026-11-20 18:00') });
+  const g3 = await book({ pickup_at: await local('2026-12-02 09:00') });
+  await as(U.alpha, `update bookings set account_id = $1 where id in ($2,$3,$4)`, [globex, g1, g2, g3]);
+  const inv = (await as(U.bravo, `select create_account_invoice($1,'2026-11-01','2026-11-30') id`, [globex])).rows[0].id;
+  const invRow = (await db.query(`select * from invoices where id = $1`, [inv])).rows[0];
+  const expect2 = (await db.query(`select sum(total) s from bookings where id in ($1,$2)`, [g1, g2])).rows[0].s;
+  check('accountant invoices November: 2 bookings, totals add up', near(invRow.total, expect2) && (await db.query(`select count(*)::int n from invoice_items where invoice_id = $1`, [inv])).rows[0].n === 2);
+  check('due date follows the client payment terms', (invRow.due_on - invRow.issued_on) / 864e5 === 15);
+  check('same period again has nothing left to bill', (await as(U.bravo, `select create_account_invoice($1,'2026-11-01','2026-11-30') id`, [globex])).rows[0].id === null);
+  check('dispatcher cannot invoice', await fails(U.driver, `select create_account_invoice($1,'2026-11-01','2026-11-30')`, [globex]));
+  check('payment before sending is refused', await fails(U.bravo, `select record_invoice_payment($1, 10)`, [inv]));
+  await as(U.bravo, `select set_invoice_status($1,'sent')`, [inv]);
+  const age = (await as(U.bravo, `select * from account_ageing($1)`, [a])).rows;
+  check('ageing shows the sent invoice as current', age.some(r => r.account_name === 'Globex' && near(r.current_due, expect2)));
+  check('overpayment refused', await fails(U.bravo, `select record_invoice_payment($1, $2)`, [inv, Number(expect2) + 1]));
+  await as(U.bravo, `select record_invoice_payment($1, 100, 'cheque', 'CHQ-1001')`, [inv]);
+  check('part payment is spread to the first booking', near((await db.query(`select paid_amount from bookings where id = $1`, [g1])).rows[0].paid_amount, 100));
+  const rest = (await as(U.bravo, `select record_invoice_payment($1, $2, 'bank_transfer', 'WIRE-77') r`, [inv, Number(expect2) - 100])).rows[0].r;
+  check('full payment marks the invoice paid and both bookings paid', rest.status === 'paid'
+    && (await db.query(`select count(*)::int n from bookings where id in ($1,$2) and payment_status = 'paid'`, [g1, g2])).rows[0].n === 2, JSON.stringify(rest));
+  check('paid invoice cannot be voided', await fails(U.bravo, `select set_invoice_status($1,'void')`, [inv]));
+
+  // 5. Payroll
+  await as(U.alpha, `update drivers set pay_percent = 30 where id = $1`, [driverId]);
+  const p1 = await book({ pickup_at: await local('2026-10-05 10:00'), tip_percent: 10 });
+  const pt = (await db.query(`select id from trips where booking_id = $1`, [p1])).rows[0].id;
+  await as(U.alpha, `update trips set driver_id = $2, status = 'assigned' where id = $1`, [pt, driverId]);
+  await as(U.alpha, `update trips set status = 'completed' where id = $1`, [pt]);
+  const run = (await as(U.bravo, `select create_pay_run($1,'2026-10-01','2026-10-31') id`, [a])).rows[0].id;
+  const line = (await db.query(`select * from pay_run_lines where pay_run_id = $1 and driver_id = $2`, [run, driverId])).rows[0];
+  const tc = (await db.query(`select driver_pay, pay_run_id from trip_costs where trip_id = $1`, [pt])).rows[0];
+  check('auto pay is 30% of the fare and the trip joins the run', near(tc.driver_pay, 34.2) && tc.pay_run_id === run, JSON.stringify(tc));
+  check('pay run line adds tips to pay', near(line.tips, 11.4) && near(line.total, Number(line.driver_pay) + Number(line.tips)), JSON.stringify(line));
+  check('trips are not paid twice', (await as(U.bravo, `select create_pay_run($1,'2026-10-01','2026-10-31') id`, [a])).rows[0].id === null);
+  check('driver sees own pay line', (await as(U.driver, `select count(*)::int n from pay_run_lines`)).rows[0].n >= 1);
+  await as(U.bravo, `select delete_pay_run($1)`, [run]);
+  const run2 = (await as(U.bravo, `select create_pay_run($1,'2026-10-01','2026-10-31') id`, [a])).rows[0].id;
+  check('deleting a draft run releases its trips', run2 !== null);
+  await as(U.bravo, `select set_pay_run_paid($1)`, [run2]);
+  check('paid run cannot be deleted', await fails(U.bravo, `select delete_pay_run($1)`, [run2]));
+
+  // 6. Recurring (crosses the end of daylight saving on 1 Nov 2026)
+  const series = (await as(U.alpha, `select create_recurring_bookings($1,$2,$3::jsonb,$4::jsonb) r`, [a, contact,
+    P({ passenger_name: 'Commuter', pickup_address: 'Home', pickup_at: await local('2026-10-26 08:30') }),
+    JSON.stringify({ freq: 'weekly', days: [1, 3, 5], until: '2026-11-06' })])).rows[0].r;
+  check('weekly Mon/Wed/Fri for two weeks makes 6 bookings', series.count === 6);
+  const hours = (await db.query(`select distinct to_char(t.pickup_at at time zone 'America/Toronto','HH24:MI') h from trips t join bookings b on b.id = t.booking_id where b.series_id = $1`, [series.series_id])).rows;
+  check('local pickup time stays 08:30 across the clock change', hours.length === 1 && hours[0].h === '08:30');
+  check('daily every 2 days', (await as(U.alpha, `select create_recurring_bookings($1,$2,$3::jsonb,$4::jsonb) r`, [a, contact,
+    P({ passenger_name: 'D', pickup_address: 'H', pickup_at: await local('2026-11-10 07:00') }), JSON.stringify({ freq: 'daily', every: 2, until: '2026-11-16' })])).rows[0].r.count === 4);
+  check('more than 60 is refused', await fails(U.alpha, `select create_recurring_bookings($1,$2,$3::jsonb,$4::jsonb)`, [a, contact,
+    P({ passenger_name: 'D', pickup_address: 'H', pickup_at: await local('2026-11-10 07:00') }), JSON.stringify({ freq: 'daily', until: '2027-06-01' })]));
+  const cancelled = (await as(U.alpha, `select cancel_series($1,'2026-11-02') n`, [series.series_id])).rows[0].n;
+  check('cancel the rest of a series from a date', cancelled === 3);
+
+  // 7. Availability and 8. compliance
+  const at = (await db.query(`select id, pickup_at from trips where booking_id = $1`, [g3])).rows[0];
+  const veh = (await as(U.alpha, `insert into vehicles (org_id, class_id, label, plate) values ($1,$2,'Sedan 7','ABC 123') returning id`, [a, sedanA])).rows[0].id;
+  await as(U.alpha, `insert into driver_shifts (org_id, driver_id, kind, starts_at, ends_at, note) values ($1,$2,'time_off',$3::timestamptz - interval '1 hour',$3::timestamptz + interval '1 day','Vacation')`, [a, driverId, at.pickup_at]);
+  await as(U.alpha, `insert into vehicle_blocks (org_id, vehicle_id, starts_at, ends_at, reason) values ($1,$2,$3::timestamptz - interval '2 hours',$3::timestamptz + interval '2 hours','Brakes')`, [a, veh, at.pickup_at]);
+  await as(U.alpha, `insert into vehicle_documents (org_id, vehicle_id, kind, expires_on) values ($1,$2,'Insurance', current_date - 1)`, [a, veh]);
+  await as(U.alpha, `insert into driver_documents (org_id, driver_id, kind, expires_on) values ($1,$2,'Chauffeur licence', current_date + 10)`, [a, driverId]);
+  const warns = (await as(U.alpha, `select assignment_warnings($1,$2,$3) w`, [at.id, driverId, veh])).rows[0].w.map(w => w.code).sort();
+  check('assign warnings: time off, vehicle blocked, expired insurance', ['time_off', 'vehicle_blocked', 'vehicle_document_expired'].every(c => warns.includes(c)), JSON.stringify(warns));
+  const free = (await as(U.alpha, `select assignment_warnings($1,null,null) w`, [at.id])).rows[0].w;
+  check('no warnings when nobody is chosen', free.length === 0);
+  const alerts = (await as(U.alpha, `select * from compliance_alerts($1, 30)`, [a])).rows;
+  check('compliance lists expired and soon-expiring documents', alerts.some(r => r.kind === 'Insurance' && r.days_left === -1) && alerts.some(r => r.kind === 'Chauffeur licence' && r.days_left === 10));
+  check('outsider cannot read compliance', await fails(OUT, `select * from compliance_alerts($1)`, [a]));
+
+  // 9. Ratings
+  const done = await book({ pickup_at: new Date(Date.now() + 864e5).toISOString() });
+  const code = (await db.query(`select public_code from bookings where id = $1`, [done])).rows[0].public_code;
+  check('cannot rate before the trip is done', await (async () => { try { await asAnon(`select public_rate_booking('alpha',$1,5)`, [code]); return false; } catch { return true; } })());
+  const dt = (await db.query(`select id from trips where booking_id = $1`, [done])).rows[0].id;
+  await as(U.alpha, `update trips set driver_id = $2, status = 'completed' where id = $1`, [dt, driverId]);
+  await as(U.alpha, `update bookings set status = 'completed' where id = $1`, [done]);
+  check('status page offers rating', (await asAnon(`select public_booking_status('alpha',$1) s`, [code])).rows[0].s.can_rate === true);
+  await asAnon(`select public_rate_booking('alpha',$1,5,'Immaculate car')`, [code]);
+  check('rating once only', await (async () => { try { await asAnon(`select public_rate_booking('alpha',$1,4)`, [code]); return false; } catch { return true; } })());
+  check('driver average rating', (await as(U.alpha, `select * from driver_ratings($1)`, [a])).rows.some(r => r.driver_name === 'Dana Driver' && Number(r.average) === 5));
+
+  // 10. Notifications
+  await as(U.alpha, `update contacts set email = 'casey@test.com', phone = '+14165550999' where id = $1`, [contact]);
+  check('default templates install (16)', (await as(U.alpha, `select install_default_templates($1) n`, [a])).rows[0].n === 16);
+  check('installing again adds none', (await as(U.alpha, `select install_default_templates($1) n`, [a])).rows[0].n === 0);
+  await db.query(`update platform_settings set app_url = 'https://velvet.example/'`);
+  const nb = await book({ pickup_at: await local('2026-12-10 14:15') });
+  const conf = (await db.query(`select * from notification_outbox where booking_id = $1 and event = 'booking_confirmed' order by channel`, [nb])).rows;
+  check('confirmation email and SMS queued on booking', conf.length === 2 && conf[0].to_address === 'casey@test.com' && conf[1].to_address === '+14165550123', JSON.stringify(conf.map(c => c.to_address)));
+  check('placeholders filled, time in operator timezone, link built', !conf[0].body.includes('{{') && conf[0].body.includes('02:15 PM') && conf[0].body.includes('https://velvet.example/book/alpha/status/'), conf[0].body);
+  const nt = (await db.query(`select id from trips where booking_id = $1`, [nb])).rows[0].id;
+  await as(U.alpha, `select assign_trip($1,$2,$3)`, [nt, driverId, veh]);
+  const asg = (await db.query(`select body from notification_outbox where booking_id = $1 and event = 'driver_assigned'`, [nb])).rows[0];
+  check('driver assigned SMS names driver and car', asg && asg.body.includes('Dana Driver') && asg.body.includes('ABC 123'), asg?.body);
+  await as(U.alpha, `select cancel_booking($1)`, [nb]);
+  check('cancellation email queued', (await db.query(`select count(*)::int n from notification_outbox where booking_id = $1 and event = 'booking_cancelled'`, [nb])).rows[0].n === 1);
+  check('preview fills a template', (await as(U.alpha, `select preview_template($1,'Hi {{passenger_name}}') t`, [nb])).rows[0].t === 'Hi Robin Rider');
+  check('customer cannot read the outbox', (await as(U.customer, `select count(*)::int n from notification_outbox`)).rows[0].n === 0);
+  check('dispatcher cannot edit templates', (await as('00000000-0000-0000-0000-000000000101', `update notification_templates set body = 'x' returning id`)).rows.length === 0);
+
+  // 11. Terms
+  await as(U.alpha, `update orgs set require_terms = true, terms_text = 'Cancellations within 24 hours are charged 50%.', terms_version = 2 where id = $1`, [a]);
+  const req = P({ booker_name: 'Terry', booker_email: 'terry@test.com', pickup_at: new Date(Date.now() + 3 * 864e5).toISOString(), pickup_address: 'A' });
+  check('booking page refuses without accepting terms', await (async () => { try { await asAnon(`select public_create_booking_v2('alpha',$1::jsonb)`, [req]); return false; } catch { return true; } })());
+  const okReq = (await asAnon(`select public_create_booking_v2('alpha',$1::jsonb) r`, [JSON.stringify({ ...JSON.parse(req), accept_terms: true })])).rows[0].r;
+  check('accepted terms version is stored', (await db.query(`select terms_version from bookings where public_code = $1`, [okReq.public_code])).rows[0].terms_version === 2);
+  check('booking page shows the terms', (await asAnon(`select public_operator('alpha') o`)).rows[0].o.terms_text.startsWith('Cancellations'));
+  await as(U.alpha, `update orgs set require_terms = false where id = $1`, [a]);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
