@@ -16,7 +16,18 @@ Do this in the Supabase dashboard for your project. Keep the service role key ou
 10. Paste `0008_tax_precision.sql` and run it (exact Quebec tax rate).
 11. Paste `0009_ops_depth.sql` and run it (customer web sign-in, re-price, cancel with reason).
 12. Paste `0010_booking_depth.sql` and run it (round trips, stops, extras, promo codes, quotes, branding). For address search see `docs/MAPS_SETUP.md`.
-13. Make yourself super admin: `insert into platform_admins (user_id) select id from auth.users where email = 'YOUR_EMAIL';`
+13. Paste `0011_access.sql` and run it (invitations, roles for every portal, suspension).
+14. Make yourself platform owner. This works whether or not that email has signed up yet:
+    `select app.bootstrap_platform_owner('YOUR_ADMIN_EMAIL');`
+    It answers "granted now" or "will be granted when ... signs in".
+
+## 1b. Sign-in links (do this once, or confirmation and invite emails open localhost)
+
+Authentication, URL Configuration:
+- Site URL: your live web address (for now the Lovable preview URL).
+- Redirect URLs: add `https://id-preview--9ffac9da-f0de-4950-806e-56cf589a38cf.lovable.app/**` and later your live domain with `/**`.
+
+Supabase's built-in email sender allows only a few emails per hour, which is enough for testing. Before inviting real customers, add your own SMTP (for example Resend) under Authentication, Emails, SMTP settings. No code changes.
 
 If any step errors, copy the full error text back to Claude. Do not edit the SQL yourself.
 

@@ -382,5 +382,126 @@ console.log('Booking depth (0010)');
   check('promo codes are staff only', (await as(U.customer, `select count(*)::int n from promo_codes`)).rows[0].n === 0);
 }
 
+console.log('Users and access (0011)');
+{
+  const uid = (n) => `00000000-0000-0000-0000-0000000001${String(n).padStart(2, '0')}`;
+  const signup = (n, email) => db.query(`insert into auth.users (id, email) values ($1, $2)`, [uid(n), email]);
+  const failsAnon = async (sql, params = []) => { try { await asAnon(sql, params); return false; } catch { return true; } };
+
+  // Invite someone with no account yet, then they sign up and sign in
+  const inv = (await as(U.alpha, `select invite_user($1,'Dispo@Test.com','dispatcher',null,'Dee Dispatcher') r`, [a])).rows[0].r;
+  check('invite for a new person waits for sign-in', inv.status === 'invited' && inv.token.length === 64);
+  const pv = (await asAnon(`select invitation_preview($1) p`, [inv.token])).rows[0].p;
+  if (!(pv && pv.org_name === 'Alpha Limo')) console.log('DEBUG preview', JSON.stringify(pv), inv.token);
+  check('invite link preview shows company, role and state', pv.org_name.startsWith('Alpha Limo') && pv.role === 'dispatcher' && pv.state === 'open' && pv.email === 'dispo@test.com');
+  check('preview of a wrong token shows nothing', (await asAnon(`select invitation_preview('x') p`)).rows[0].p === null);
+  await signup(1, 'dispo@test.com');
+  check('nothing before claiming', (await as(uid(1), `select count(*)::int n from bookings`)).rows[0].n === 0);
+  const got = (await as(uid(1), `select claim_invitations() r`)).rows[0].r;
+  if (!(got.length === 1)) console.log('DEBUG claim', JSON.stringify(got));
+  check('sign-in accepts the invitation', got.length === 1 && got[0].role === 'dispatcher' && got[0].org_name.startsWith('Alpha Limo'));
+  check('dispatcher now works in the company', (await as(uid(1), `select count(*)::int n from bookings`)).rows[0].n > 0);
+  check('claiming again grants nothing new', (await as(uid(1), `select claim_invitations() r`)).rows[0].r.length === 0);
+  check('my_access lists the portal', (await as(uid(1), `select my_access() r`)).rows[0].r.portals.some(p => p.role === 'dispatcher' && p.org_slug === 'alpha'));
+  check('accepted link shows accepted', (await asAnon(`select invitation_preview($1) p`, [inv.token])).rows[0].p.state === 'accepted');
+
+  // Who may invite whom
+  check('dispatcher cannot invite', await fails(uid(1), `select invite_user($1,'x@test.com','driver')`, [a]));
+  check('another company cannot invite into alpha', await fails(U.bravo, `select invite_user($1,'x@test.com','driver')`, [a]));
+  const adm = (await as(U.alpha, `select invite_user($1,'adm@test.com','admin') r`, [a])).rows[0].r;
+  await signup(2, 'adm@test.com'); await as(uid(2), `select claim_invitations()`);
+  check('admin cannot invite another admin', await fails(uid(2), `select invite_user($1,'adm2@test.com','admin')`, [a]));
+  check('admin can invite a driver', (await as(uid(2), `select invite_user($1,'drv@test.com','driver',null,'Sam Driver') r`, [a])).rows[0].r.status === 'invited');
+  await signup(3, 'drv@test.com'); await as(uid(3), `select claim_invitations()`);
+  check('driver invite creates the driver record', (await db.query(`select full_name from drivers where user_id = $1`, [uid(3)])).rows[0]?.full_name === 'Sam Driver');
+
+  // Existing account: access is immediate
+  const acc = (await as(U.alpha, `select invite_user($1,'bravo@test.com','accountant') r`, [a])).rows[0].r;
+  check('existing account is added at once', acc.status === 'added');
+  check('accountant reads bookings and payments', (await as(U.bravo, `select count(*)::int n from bookings where org_id = $1`, [a])).rows[0].n > 0
+    && (await as(U.bravo, `select count(*)::int n from payments where org_id = $1`, [a])).rows.length === 1);
+  check('accountant cannot edit bookings', (await as(U.bravo, `update bookings set passenger_name = 'X' where org_id = $1 returning id`, [a])).rows.length === 0);
+  check('accountant cannot change prices', (await as(U.bravo, `update rate_cards set base_amount = 1 where org_id = $1 returning id`, [a])).rows.length === 0);
+  check('accountant cannot dispatch', await fails(U.bravo, `select assign_trip((select id from trips where org_id = $1 limit 1), null)`, [a]));
+
+  // Owner protection and member changes
+  const ownerRow = (await db.query(`select id from memberships where org_id = $1 and role = 'owner'`, [a])).rows[0].id;
+  const dispoRow = (await db.query(`select id from memberships where user_id = $1`, [uid(1)])).rows[0].id;
+  const admRow = (await db.query(`select id from memberships where user_id = $1`, [uid(2)])).rows[0].id;
+  check('admin cannot pause the owner', await fails(uid(2), `select update_member($1,'pause')`, [ownerRow]));
+  check('admin cannot demote the owner directly', await fails(uid(2), `update memberships set role = 'dispatcher' where id = $1`, [ownerRow]));
+  check('admin cannot make an owner directly', await fails(uid(2), `insert into memberships (org_id, user_id, role) values ($1,$2,'owner')`, [a, uid(1)]));
+  check('owner cannot remove own access', await fails(U.alpha, `select update_member($1,'remove')`, [ownerRow]));
+  await as(uid(2), `select update_member($1,'role','accountant')`, [dispoRow]);
+  check('admin changes dispatcher to accountant', (await db.query(`select role from memberships where id = $1`, [dispoRow])).rows[0].role === 'accountant');
+  check('admin cannot change another admin', await fails(uid(2), `select update_member($1,'role','dispatcher')`, [admRow]));
+  await as(U.alpha, `select update_member($1,'pause')`, [dispoRow]);
+  check('paused member loses access', (await as(uid(1), `select count(*)::int n from bookings`)).rows[0].n === 0);
+  await as(U.alpha, `select update_member($1,'resume')`, [dispoRow]);
+  check('resumed member regains access', (await as(uid(1), `select count(*)::int n from bookings`)).rows[0].n > 0);
+  const oa = (await as(U.alpha, `select org_access($1) r`, [a])).rows[0].r;
+  check('org_access lists members and open invitations', oa.members.length >= 5 && Array.isArray(oa.invitations));
+  check('dispatcher cannot see org_access', await fails(uid(1), `select org_access($1)`, [a]));
+
+  // Revoke and renew
+  const rv = (await as(U.alpha, `select invite_user($1,'late@test.com','dispatcher') r`, [a])).rows[0].r;
+  await as(U.alpha, `select revoke_invitation($1)`, [rv.invitation_id]);
+  await signup(4, 'late@test.com');
+  check('revoked invitation grants nothing', (await as(uid(4), `select claim_invitations() r`)).rows[0].r.length === 0);
+  const ex = (await as(U.alpha, `select invite_user($1,'exp@test.com','dispatcher') r`, [a])).rows[0].r;
+  await db.query(`update invitations set expires_at = now() - interval '1 day' where id = $1`, [ex.invitation_id]);
+  await signup(5, 'exp@test.com');
+  check('expired invitation grants nothing', (await as(uid(5), `select claim_invitations() r`)).rows[0].r.length === 0);
+  await as(U.alpha, `select renew_invitation($1)`, [ex.invitation_id]);
+  check('renewed invitation works', (await as(uid(5), `select claim_invitations() r`)).rows[0].r.length === 1);
+
+  // Corporate client portal
+  const acme = (await as(U.alpha, `insert into accounts (org_id, name) values ($1,'Acme Corp') returning id`, [a])).rows[0].id;
+  check('client role needs a client company', await fails(U.alpha, `select invite_user($1,'ca@acme.com','client_admin')`, [a]));
+  await as(U.alpha, `select invite_user($1,'ca@acme.com','client_admin',$2,'Cara Admin')`, [a, acme]);
+  await as(U.alpha, `select invite_user($1,'cb@acme.com','client_booker',$2)`, [a, acme]);
+  await signup(6, 'ca@acme.com'); await signup(7, 'cb@acme.com');
+  await as(uid(6), `select claim_invitations()`); await as(uid(7), `select claim_invitations()`);
+  const when = new Date(Date.now() + 2 * 864e5).toISOString();
+  const trip = (o) => JSON.stringify({ class_id: sedanA, service: 'one_way', distance: 20, pickup_at: when, pickup_address: 'Acme HQ', passenger_name: 'Exec', ...o });
+  const cb1 = (await as(uid(7), `select client_create_booking($1,$2,$3::jsonb) id`, [a, acme, trip({})])).rows[0].id;
+  const cbRow = (await db.query(`select status, account_id from bookings where id = $1`, [cb1])).rows[0];
+  check('client booking is on the account and waits as a quote', cbRow.account_id === acme && cbRow.status === 'quoted');
+  await as(U.alpha, `update accounts set auto_confirm = true where id = $1`, [acme]);
+  const ca1 = (await as(uid(6), `select client_create_booking($1,$2,$3::jsonb) id`, [a, acme, trip({ passenger_name: 'CEO' })])).rows[0].id;
+  check('auto-confirm accounts skip the quote', (await db.query(`select status from bookings where id = $1`, [ca1])).rows[0].status === 'confirmed');
+  check('client admin sees every company booking', (await as(uid(6), `select count(*)::int n from bookings`)).rows[0].n === 2);
+  check('client admin sees trips and lines of colleagues', (await as(uid(6), `select count(*)::int n from booking_lines where booking_id = $1`, [cb1])).rows[0].n >= 1
+    && (await as(uid(6), `select count(*)::int n from trips where booking_id = $1`, [cb1])).rows[0].n === 1);
+  check('client booker sees only own bookings', (await as(uid(7), `select count(*)::int n from bookings`)).rows[0].n === 1);
+  check('client reads own company record', (await as(uid(7), `select name from accounts`)).rows[0]?.name === 'Acme Corp');
+  check('client cannot book on another account', await fails(uid(7), `select client_create_booking($1,$2,$3::jsonb)`, [a, (await as(U.alpha, `insert into accounts (org_id, name) values ($1,'Other') returning id`, [a])).rows[0].id, trip({})]));
+  check('clients cannot see other customers', (await as(uid(6), `select count(*)::int n from contacts`)).rows[0].n === 0);
+  check('travel agency cannot invite drivers', await fails(BOSS, `select invite_user($1,'d@test.com','driver')`, [cc.org_id]));
+
+  // Platform console
+  const pa = (await as(BOSS, `select invite_user(null,'pa@test.com','platform_admin') r`)).rows[0].r;
+  await signup(8, 'pa@test.com'); await as(uid(8), `select claim_invitations()`);
+  check('platform admin invite works', (await as(uid(8), `select am_platform_admin() r`)).rows[0].r === true);
+  check('platform admin (not owner) cannot add platform admins', await fails(uid(8), `select invite_user(null,'x@test.com','platform_admin')`));
+  check('platform admin cannot suspend the platform owner', await fails(uid(8), `select platform_set_user_suspended($1,true)`, [BOSS]));
+  await as(uid(8), `select platform_set_user_suspended($1,true,'test')`, [uid(1)]);
+  check('suspended person loses all access', (await as(uid(1), `select count(*)::int n from bookings`)).rows[0].n === 0
+    && (await as(uid(1), `select my_access() r`)).rows[0].r.suspended === true);
+  check('suspended person cannot lift it', await fails(uid(1), `delete from user_suspensions`));
+  await as(uid(8), `select platform_set_user_suspended($1,false)`, [uid(1)]);
+  check('restored person works again', (await as(uid(1), `select count(*)::int n from bookings`)).rows[0].n > 0);
+  check('last platform owner cannot be removed', await fails(BOSS, `select platform_set_admin($1,null)`, [BOSS]));
+  const pu = (await as(BOSS, `select * from platform_users('acme')`)).rows;
+  check('platform users shows client access with company', pu.length === 2 && pu.some(r => r.memberships[0].account_name === 'Acme Corp'));
+  check('platform sees open invitations', Array.isArray((await as(BOSS, `select platform_invitations() r`)).rows[0].r));
+  let boot; try { boot = (await db.query(`select app.bootstrap_platform_owner('Boot@Test.com') r`)).rows[0].r; } catch (e) { boot = 'ERR ' + e.message; }
+  check('bootstrap before sign-up', String(boot).startsWith('will be granted'), boot);
+  await signup(9, 'boot@test.com'); await as(uid(9), `select claim_invitations()`);
+  check('bootstrap grants platform owner on first sign-in', (await as(uid(9), `select my_access() r`)).rows[0].r.platform_role === 'owner');
+  check('clients cannot call bootstrap', await fails(U.alpha, `select app.bootstrap_platform_owner('x@test.com')`));
+  check('company sign-up still makes the founder owner', !!(await as(uid(4), `select create_operator('Late Limo','late-limo','CA','CAD','en','America/Toronto','metric',false,'CA-ON-HST') id`)).rows[0].id);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
