@@ -718,6 +718,11 @@ console.log('Moovs parity (0013)');
   const upsertId = (await as(U.alpha, `select upsert_zone($1,'Core','area',43.65,-79.36,1,$2::jsonb) id`, [a, JSON.stringify(poly)])).rows[0].id;
   check('upsert_zone updates the existing zone by name', upsertId === coreZone);
 
+  // A drawn-boundary zone has no radius (the frontend sends radius_km = null for these); the
+  // column must accept that, matching app.zone_fare's coalesce(radius_km, 0) treatment (0014).
+  const noRadiusId = (await as(U.alpha, `select upsert_zone($1,'Core 2','area',43.65,-79.36,null,$2::jsonb) id`, [a, JSON.stringify(poly)])).rows[0].id;
+  check('a drawn zone saves with no radius', !!noRadiusId);
+
   // 2. Driver scorecards and penalties folded into pay runs
   const lateBooking = (await as(U.alpha, `select create_booking_v2($1,$2,$3::jsonb) id`, [a, contact,
     P({ passenger_name: 'Late Rider', pickup_address: 'A', pickup_at: new Date(Date.now() + 2 * 864e5).toISOString() })])).rows[0].id;
