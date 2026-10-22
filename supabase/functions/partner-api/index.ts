@@ -72,7 +72,20 @@ async function authenticate(req: Request, admin: SupabaseClient): Promise<Authed
   return { clientId: cred.client_id };
 }
 
-/** Runs body through the stored idempotency record for this client+key, or records a fresh one. */
+/**
+ * Runs body through the stored idempotency record for this client+key, or claims the key and
+ * records a fresh one.
+ *
+ * The original version of this function checked "does a row exist?" and only inserted
+ * AFTER running handler() -- which is a genuine race: two requests with the same key sent
+ * concurrently (a client retrying on a slow connection, a double-tap on a partner's own UI)
+ * can both see "no row yet", both run handler(), and for api_create_booking that means two
+ * real bookings instead of one. Fixed by claiming the key FIRST, atomically, via an
+ * ignoreDuplicates upsert (ON CONFLICT (client_id, key) DO NOTHING): only the request that
+ * actually inserts the row gets to run handler(); every other concurrent request with the
+ * same key sees the conflict and either replays the finished response or, if the first
+ * request is still mid-flight, polls briefly for it rather than re-running the side effect.
+ */
 async function withIdempotency(
   admin: SupabaseClient,
   clientId: string,
@@ -84,27 +97,57 @@ async function withIdempotency(
   if (!key) throw new HttpError(400, "Idempotency-Key header is required for this request");
   const hash = await sha256Hex(rawBody);
 
-  const { data: existing } = await admin
+  const { data: claimed, error: claimErr } = await admin
     .from("idempotency_keys")
-    .select("request_hash, response_status, response_body")
-    .eq("client_id", clientId)
-    .eq("key", key)
+    .upsert({ client_id: clientId, key, request_hash: hash }, { onConflict: "client_id,key", ignoreDuplicates: true })
+    .select("id")
     .maybeSingle();
-  if (existing) {
-    if (existing.request_hash !== hash) {
-      throw new HttpError(409, "This Idempotency-Key was already used with a different request body");
-    }
-    return { status: existing.response_status ?? 200, body: existing.response_body };
+  if (claimErr) throw new HttpError(500, "Could not record idempotency key");
+
+  if (!claimed) {
+    // Someone else (maybe this same client, retrying) already claimed this key. Wait for
+    // their result rather than running handler() ourselves.
+    return await waitForIdempotentResult(admin, clientId, key, hash);
   }
 
-  const result = await handler();
-  // Best-effort store; a race on the unique (client_id, key) constraint just means another
-  // concurrent request with the same key won the insert -- fine, both produced the same result.
-  await admin.from("idempotency_keys").insert({
-    client_id: clientId, key, request_hash: hash,
-    response_status: result.status, response_body: result.body,
-  });
-  return result;
+  // We won the claim: we're the one request that gets to actually run the side effect.
+  try {
+    const result = await handler();
+    await admin.from("idempotency_keys")
+      .update({ response_status: result.status, response_body: result.body })
+      .eq("client_id", clientId).eq("key", key);
+    return result;
+  } catch (e) {
+    // handler() failed before producing a cacheable result -- release the claim so a retry
+    // with the same key can actually try again, instead of polling forever for a response
+    // that will never arrive.
+    await admin.from("idempotency_keys").delete().eq("client_id", clientId).eq("key", key);
+    throw e;
+  }
+}
+
+/** Polls a key claimed by a concurrent request until its response is written, or gives up. */
+async function waitForIdempotentResult(
+  admin: SupabaseClient, clientId: string, key: string, hash: string,
+): Promise<{ status: number; body: unknown }> {
+  const maxAttempts = 10;
+  const delayMs = 300;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { data: row } = await admin
+      .from("idempotency_keys")
+      .select("request_hash, response_status, response_body")
+      .eq("client_id", clientId).eq("key", key)
+      .maybeSingle();
+    if (!row) break; // the other request's handler() threw and released the claim; fall through
+    if (row.request_hash !== hash) {
+      throw new HttpError(409, "This Idempotency-Key was already used with a different request body");
+    }
+    if (row.response_status !== null) {
+      return { status: row.response_status, body: row.response_body };
+    }
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  throw new HttpError(409, "A request with this Idempotency-Key is already being processed. Retry shortly.");
 }
 
 function requestId(): string {

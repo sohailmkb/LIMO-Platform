@@ -32,9 +32,15 @@ async function hmacHex(secret: string, message: string): Promise<string> {
 Deno.serve(async (req) => {
   // No request body expected -- the scheduler just needs to hit this URL. A shared secret
   // check (not a user-facing API, so a simple header compare is enough here) keeps a random
-  // internet request from triggering a sweep.
+  // internet request from triggering a sweep. Fail CLOSED: an unset secret refuses every
+  // request rather than skipping the check, so a misconfigured deploy can't accidentally
+  // leave this endpoint open to anyone who finds the URL.
   const expected = Deno.env.get("WEBHOOK_WORKER_SECRET");
-  if (expected && req.headers.get("X-Worker-Secret") !== expected) {
+  if (!expected) {
+    console.error("WEBHOOK_WORKER_SECRET is not set -- refusing all requests until it's configured");
+    return new Response("Worker secret not configured", { status: 500 });
+  }
+  if (req.headers.get("X-Worker-Secret") !== expected) {
     return new Response("Forbidden", { status: 403 });
   }
 
