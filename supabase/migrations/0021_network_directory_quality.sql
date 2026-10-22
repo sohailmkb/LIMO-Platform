@@ -14,7 +14,13 @@
 -- farmed out to a suspended partner, not just discouraged in the UI. This was previously
 -- enforceable only by convention.
 
-create or replace function public.network_directory() returns table (
+-- Postgres won't let CREATE OR REPLACE change a set-returning function's OUT-parameter
+-- row type (the three new columns), even though the first four are unchanged. Drop and
+-- recreate instead -- and because DROP FUNCTION wipes any grants on it, the original
+-- grant (0003: anon, authenticated) has to be re-issued below, not just assumed to survive.
+drop function if exists public.network_directory();
+
+create function public.network_directory() returns table (
   id uuid, name text, slug text, country text,
   network_status text, acceptance_rate numeric, completion_rate numeric
 )
@@ -40,6 +46,7 @@ language sql stable security definer set search_path = public as $$
   where o.listed_in_network and o.status = 'active' and o.kind = 'operator'
   order by o.name;
 $$;
+grant execute on function public.network_directory() to anon, authenticated;
 
 create function app.block_suspended_partner() returns trigger
 language plpgsql security definer set search_path = public as $$
